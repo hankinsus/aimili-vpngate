@@ -22,6 +22,14 @@ from typing import Any
 import concurrent.futures
 import sys
 
+# Force socket to resolve IPv4 only to avoid slow AAAA (IPv6) DNS resolution timeouts (e.g. in WSL)
+_orig_getaddrinfo = socket.getaddrinfo
+def _ipv4_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    if family == 0:
+        family = socket.AF_INET
+    return _orig_getaddrinfo(host, port, family, type, proto, flags)
+socket.getaddrinfo = _ipv4_getaddrinfo
+
 import vpn_utils
 import proxy_server
 
@@ -3033,7 +3041,7 @@ def check_proxy_health() -> dict[str, Any]:
     opener = urllib.request.build_opener(proxy_handler)
     try:
         t0 = time.perf_counter()
-        req = urllib.request.Request("https://api.ipify.org?format=json", headers={"User-Agent": "curl/7.68.0"})
+        req = urllib.request.Request("http://api.ipify.org?format=json", headers={"User-Agent": "curl/7.68.0"})
         with opener.open(req, timeout=5) as response:
             res_data = response.read().decode('utf-8')
             latency = int((time.perf_counter() - t0) * 1000)
@@ -3046,7 +3054,7 @@ def check_proxy_health() -> dict[str, Any]:
     except Exception as e:
         try:
             t0 = time.perf_counter()
-            req = urllib.request.Request("https://ifconfig.me/ip", headers={"User-Agent": "curl/7.68.0"})
+            req = urllib.request.Request("http://ifconfig.me/ip", headers={"User-Agent": "curl/7.68.0"})
             with opener.open(req, timeout=5) as response:
                 ip = response.read().decode('utf-8').strip()
                 latency = int((time.perf_counter() - t0) * 1000)
