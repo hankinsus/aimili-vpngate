@@ -2661,7 +2661,7 @@ INDEX_HTML = r"""<!doctype html>
       <div id="admin_dropdown" class="dropdown-content">
         <a href="javascript:void(0)" onclick="openCredentialsModal()">
           <svg xmlns="http://www.w3.org/2000/svg" style="width:14px; height:14px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" /></svg>
-          账号密码设置
+          网页安全
         </a>
         <a href="javascript:void(0)" onclick="openNetworkModal()">
           <svg xmlns="http://www.w3.org/2000/svg" style="width:14px; height:14px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" /><path stroke-linecap="round" stroke-linejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /></svg>
@@ -2694,11 +2694,16 @@ INDEX_HTML = r"""<!doctype html>
 
   <section class="toolbar">
     <select id="status_filter">
-      <option value="available">可用节点</option>
       <option value="all">全部节点</option>
-      <option value="favorites">收藏节点</option>
+      <option value="available">可用节点</option>
       <option value="unavailable">失效节点</option>
     </select>
+    <button id="btn_favorites" class="toolbar-btn" type="button" onclick="toggleFavoritesView()" style="gap: 6px;">
+      <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+        <path stroke-linecap="round" stroke-linejoin="round" d="M11.049 2.927c.3-.921 1.603-.921 1.902 0l1.519 4.674a1 1 0 00.95.69h4.907c.961 0 1.371 1.24.588 1.81l-3.97 2.883a1 1 0 00-.364 1.118l1.518 4.674c.3.922-.755 1.688-1.538 1.118l-3.971-2.883a1 1 0 00-1.175 0l-3.97 2.883c-.783.57-1.838-.197-1.538-1.118l1.518-4.674a1 1 0 00-.364-1.118l-3.97-2.883c-.783-.57-.372-1.81.588-1.81h4.906a1 1 0 00.951-.69l1.519-4.674z" />
+      </svg>
+      收藏菜单
+    </button>
     <select id="country_filter">
       <option value="">所有国家</option>
     </select>
@@ -2709,8 +2714,37 @@ INDEX_HTML = r"""<!doctype html>
     </select>
     <input id="search" placeholder="输入国家、位置、IP、ASN、运营主体等过滤节点..." />
   </section>
-  <div id="favorites_banner" style="display: none; background: rgba(245, 158, 11, 0.1); border: 1px solid rgba(245, 158, 11, 0.25); border-radius: 12px; padding: 12px 16px; margin-bottom: 20px; font-size: 13px; color: var(--warning); line-height: 1.5;">
-    ℹ️ <strong>温馨提示</strong>：您可以通过点击节点列表右侧的「☆ 收藏」按钮将心仪节点加入此列表。如果您只希望在收藏列表中自动切换和使用节点，请点击右上角「管理员 -> 代理设置」，将「IP 出站路由模式」设置为「仅用收藏」。
+  <div id="favorites_panel" style="display: none; background: rgba(22, 30, 49, 0.85); backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px); border: 1px solid var(--border-color); border-radius: 16px; padding: 20px; margin-bottom: 20px; animation: modalFadeIn 0.25s ease-out;">
+    <div style="display: flex; flex-direction: column; gap: 16px;">
+      <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 16px;">
+        <div style="display: flex; flex-direction: column; gap: 4px;">
+          <span style="font-size: 15px; font-weight: 600; color: var(--text-primary); display: flex; align-items: center; gap: 6px;">
+            ⭐ 收藏专属管理面板
+          </span>
+          <span style="font-size: 13px; color: var(--text-secondary);">
+            在这里管理您的收藏节点过滤，以及设置出站连接漂移策略。
+          </span>
+        </div>
+        <div style="display: flex; gap: 12px; align-items: center;">
+          <button id="btn_toggle_fav_routing" type="button" class="toolbar-btn" style="height: 36px; padding: 0 14px; font-size: 13px; border-radius: 6px;" onclick="toggleFavRouting()">
+            启用仅用收藏出站
+          </button>
+        </div>
+      </div>
+      
+      <div style="border-top: 1px solid rgba(255,255,255,0.06); padding-top: 16px;">
+        <label style="display: flex; align-items: flex-start; gap: 10px; cursor: pointer; user-select: none;">
+          <input type="checkbox" id="fav_fail_fallback_checkbox" style="margin-top: 3px; cursor: pointer;" onchange="handleFavFallbackChange(this.checked)" checked />
+          <div style="display: flex; flex-direction: column; gap: 2px;">
+            <span style="font-size: 14px; font-weight: 500; color: var(--text-primary);">收藏节点失效后自动切换其他（非收藏）可用节点</span>
+            <span style="font-size: 12px; color: var(--text-secondary);">勾选此项，当所有收藏节点不可用时，系统将自动使用其他最快的非收藏可用节点，保障网络连接不中断。</span>
+          </div>
+        </label>
+        <div id="fav_fallback_warning" style="display: none; margin-top: 12px; padding: 10px 14px; background: rgba(244, 63, 94, 0.1); border: 1px solid rgba(244, 63, 94, 0.25); border-radius: 8px; font-size: 12px; color: var(--danger); line-height: 1.4; animation: modalFadeIn 0.2s ease-out;">
+          ⚠️ <strong>警告</strong>：您已取消勾选此项。如果当前收藏的节点均不可用，系统将<strong>无法切换</strong>到其他可用节点，可能导致网络<strong>彻底断开连接</strong>！
+        </div>
+      </div>
+    </div>
   </div>
 
   <div class="table-wrapper">
@@ -2747,13 +2781,13 @@ INDEX_HTML = r"""<!doctype html>
     </div>
   </div>
 
-  <!-- Credentials Modal (账号密码设置) -->
+  <!-- Credentials Modal (网页安全设置) -->
   <div id="credentials_modal" class="modal">
     <div class="modal-content">
       <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px;">
         <h3 style="margin: 0; font-size: 18px; font-weight: 700; color: var(--text-primary); display: flex; align-items: center; gap: 8px;">
           <svg xmlns="http://www.w3.org/2000/svg" style="width:20px; height:20px; color: var(--primary);" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" /></svg>
-          账号密码设置
+          网页安全
         </h3>
         <button type="button" onclick="closeCredentialsModal()" style="background: transparent; border: none; padding: 4px; cursor: pointer; color: var(--text-secondary); width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; border-radius: 50%;" onmouseover="this.style.background='rgba(255,255,255,0.05)'" onmouseout="this.style.background='transparent'">
           <svg xmlns="http://www.w3.org/2000/svg" style="width:18px; height:18px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" /></svg>
@@ -2764,14 +2798,24 @@ INDEX_HTML = r"""<!doctype html>
       <div id="credentials_success" style="color: var(--success); font-size: 13px; margin-bottom: 16px; padding: 8px 12px; background: rgba(16,185,129,0.1); border: 1px solid rgba(16,185,129,0.2); border-radius: 6px; display: none;"></div>
 
       <form id="credentials_form" onsubmit="saveCredentials(event)">
-        <div class="form-group" style="margin-bottom: 16px;">
-          <label class="form-label" for="cred_username">新管理账号</label>
-          <input type="text" id="cred_username" class="input-field" required placeholder="请输入新管理账号">
+        <div class="form-group" style="margin-bottom: 12px;">
+          <label class="form-label" for="cred_username">管理账号</label>
+          <input type="text" id="cred_username" class="input-field" required placeholder="请输入管理账号">
         </div>
         
-        <div class="form-group" style="margin-bottom: 24px;">
-          <label class="form-label" for="cred_password">新安全密码</label>
-          <input type="password" id="cred_password" class="input-field" required placeholder="请输入新安全密码">
+        <div class="form-group" style="margin-bottom: 12px;">
+          <label class="form-label" for="cred_password">安全密码</label>
+          <input type="password" id="cred_password" class="input-field" required placeholder="请输入安全密码">
+        </div>
+
+        <div class="form-group" style="margin-bottom: 12px;">
+          <label class="form-label" for="cred_port">网页管理端口</label>
+          <input type="number" id="cred_port" class="input-field" required min="1" max="65535" placeholder="8787">
+        </div>
+        
+        <div class="form-group" style="margin-bottom: 20px;">
+          <label class="form-label" for="cred_suffix">登录安全后缀 (仅字母和数字)</label>
+          <input type="text" id="cred_suffix" class="input-field" required pattern="[A-Za-z0-9]+" placeholder="EJsW2EeBo9lY">
         </div>
         
         <div style="display: flex; gap: 12px; justify-content: flex-end;">
@@ -2799,46 +2843,55 @@ INDEX_HTML = r"""<!doctype html>
       <div id="network_success" style="color: var(--success); font-size: 13px; margin-bottom: 16px; padding: 8px 12px; background: rgba(16,185,129,0.1); border: 1px solid rgba(16,185,129,0.2); border-radius: 6px; display: none;"></div>
 
       <form id="network_form" onsubmit="saveNetwork(event)">
-        <div class="form-group" style="margin-bottom: 12px;">
-          <label class="form-label" for="net_port">网页管理端口</label>
-          <input type="number" id="net_port" class="input-field" required min="1" max="65535" placeholder="8787">
-        </div>
-        
-        <div class="form-group" style="margin-bottom: 12px;">
-          <label class="form-label" for="net_suffix">登录安全后缀 (仅字母和数字)</label>
-          <input type="text" id="net_suffix" class="input-field" required pattern="[A-Za-z0-9]+" placeholder="EJsW2EeBo9lY">
-        </div>
-
         <div class="form-group" style="margin-bottom: 16px;">
           <label class="form-label" for="net_proxy_port">HTTP/SOCKS5 代理出站端口</label>
           <input type="number" id="net_proxy_port" class="input-field" required min="1024" max="65535" placeholder="7928">
         </div>
 
         <div style="border-top: 1px dashed rgba(255,255,255,0.08); padding-top: 16px; margin-bottom: 16px;">
-          <div class="form-group" style="margin-bottom: 12px;">
-            <label class="form-label" for="net_routing_mode">IP 出站路由模式</label>
-            <select id="net_routing_mode" class="input-field" style="background: rgba(255, 255, 255, 0.03); border: 1px solid var(--border-color); color: var(--text-primary); outline: none; cursor: pointer; width: 100%; height: 40px; border-radius: 8px; padding: 0 12px;" onchange="handleRoutingModeChange(this.value)">
-              <option value="auto">自动配置 (智能切换，最稳定)</option>
-              <option value="fixed_ip">固定 IP (永不自动换 IP)</option>
-              <option value="fixed_region">固定地区 (锁定特定国家节点)</option>
-              <option value="favorites">仅用收藏 (只在收藏的节点中切换)</option>
-            </select>
+          <div class="form-group" style="margin-bottom: 16px;">
+            <label class="form-label">IP 出站路由模式</label>
+            <input type="hidden" id="net_routing_mode" value="auto">
+            <div class="option-group" id="routing_mode_group">
+              <div class="option-card active" data-value="auto" onclick="setRoutingMode('auto')">
+                <div class="option-card-title">自动配置</div>
+                <div class="option-card-desc">智能切换，最稳定</div>
+              </div>
+              <div class="option-card" data-value="fixed_ip" onclick="setRoutingMode('fixed_ip')">
+                <div class="option-card-title">固定 IP</div>
+                <div class="option-card-desc">锁定IP，不自动切换</div>
+              </div>
+              <div class="option-card" data-value="fixed_region" onclick="setRoutingMode('fixed_region')">
+                <div class="option-card-title">固定地区</div>
+                <div class="option-card-desc">锁定特定国家地区</div>
+              </div>
+            </div>
           </div>
           
-          <div id="net_force_country_group" class="form-group" style="margin-bottom: 12px; display: none;">
+          <div id="net_force_country_group" class="form-group" style="margin-bottom: 16px; display: none;">
             <label class="form-label" for="net_force_country">锁定国家地区</label>
             <select id="net_force_country" class="input-field" style="background: rgba(255, 255, 255, 0.03); border: 1px solid var(--border-color); color: var(--text-primary); outline: none; cursor: pointer; width: 100%; height: 40px; border-radius: 8px; padding: 0 12px;">
               <option value="">正在加载节点国家...</option>
             </select>
           </div>
           
-          <div class="form-group" style="margin-bottom: 12px;">
-            <label class="form-label" for="net_routing_ip_type">IP 出站类型过滤</label>
-            <select id="net_routing_ip_type" class="input-field" style="background: rgba(255, 255, 255, 0.03); border: 1px solid var(--border-color); color: var(--text-primary); outline: none; cursor: pointer; width: 100%; height: 40px; border-radius: 8px; padding: 0 12px;">
-              <option value="all">所有IP类型</option>
-              <option value="residential">仅静态住宅IP</option>
-              <option value="hosting">仅机房IP</option>
-            </select>
+          <div class="form-group" style="margin-bottom: 16px;">
+            <label class="form-label">IP 出站类型过滤</label>
+            <input type="hidden" id="net_routing_ip_type" value="all">
+            <div class="option-group" id="routing_ip_type_group">
+              <div class="option-card active" data-value="all" onclick="setRoutingIpType('all')">
+                <div class="option-card-title">所有IP</div>
+                <div class="option-card-desc">机房 + 住宅</div>
+              </div>
+              <div class="option-card" data-value="residential" onclick="setRoutingIpType('residential')">
+                <div class="option-card-title">住宅IP</div>
+                <div class="option-card-desc">静态家宽</div>
+              </div>
+              <div class="option-card" data-value="hosting" onclick="setRoutingIpType('hosting')">
+                <div class="option-card-title">机房IP</div>
+                <div class="option-card-desc">普通机房</div>
+              </div>
+            </div>
           </div>
           
           <div id="net_routing_warning" style="font-size: 12px; color: var(--text-secondary); line-height: 1.4; padding: 8px 12px; background: rgba(255, 255, 255, 0.02); border: 1px solid rgba(255, 255, 255, 0.05); border-radius: 6px; margin-top: 8px;">
@@ -2853,6 +2906,7 @@ INDEX_HTML = r"""<!doctype html>
       </form>
     </div>
   </div>
+
 
   <!-- Ad Modal (VPS 购买推荐) -->
   <div id="ad_modal" class="modal">
@@ -3160,7 +3214,7 @@ function getFilteredNodes() {
     if (selectedStatus === "unavailable" && (n.probe_status !== "unavailable" || n.active)) {
       return false;
     }
-    if (selectedStatus === "favorites" && (!state.favorite_node_ids || !state.favorite_node_ids.includes(n.id))) {
+    if (showFavoritesOnly && (!state.favorite_node_ids || !state.favorite_node_ids.includes(n.id))) {
       return false;
     }
     const searchStr = [
@@ -3322,9 +3376,7 @@ function render(){
     }
   }
 
-  const isFavoritesFilter = $("status_filter").value === "favorites";
-  const banner = $("favorites_banner");
-  if (banner) banner.style.display = isFavoritesFilter ? "block" : "none";
+  updateFavPanelUI();
 
   // Pagination calculation
   const totalPages = Math.ceil(shown.length / pageSize) || 1;
@@ -3642,6 +3694,161 @@ document.addEventListener("click", () => {
   if (githubDropdown) githubDropdown.style.display = "none";
 });
 
+let showFavoritesOnly = false;
+
+function toggleFavoritesView() {
+  showFavoritesOnly = !showFavoritesOnly;
+  currentPage = 1;
+  render();
+}
+
+function updateFavPanelUI() {
+  const panel = $("favorites_panel");
+  if (!panel) return;
+  panel.style.display = showFavoritesOnly ? "block" : "none";
+  
+  const btn = $("btn_favorites");
+  if (btn) {
+    if (showFavoritesOnly) {
+      btn.classList.add("active");
+    } else {
+      btn.classList.remove("active");
+    }
+  }
+
+  if (showFavoritesOnly && state) {
+    const fallbackCheckbox = $("fav_fail_fallback_checkbox");
+    if (fallbackCheckbox) {
+      fallbackCheckbox.checked = !!state.fav_fail_fallback;
+    }
+    
+    const warningDiv = $("fav_fallback_warning");
+    if (warningDiv) {
+      warningDiv.style.display = state.fav_fail_fallback ? "none" : "block";
+    }
+
+    const favRoutingBtn = $("btn_toggle_fav_routing");
+    if (favRoutingBtn) {
+      if (state.routing_mode === "favorites") {
+        favRoutingBtn.textContent = "禁用仅用收藏出站";
+        favRoutingBtn.style.background = "var(--danger-gradient)";
+        favRoutingBtn.style.borderColor = "transparent";
+        favRoutingBtn.style.color = "#ffffff";
+        favRoutingBtn.style.boxShadow = "0 0 12px rgba(244, 63, 94, 0.3)";
+      } else {
+        favRoutingBtn.textContent = "启用仅用收藏出站";
+        favRoutingBtn.style.background = "rgba(255,255,255,0.03)";
+        favRoutingBtn.style.borderColor = "var(--border-color)";
+        favRoutingBtn.style.color = "var(--text-primary)";
+        favRoutingBtn.style.boxShadow = "none";
+      }
+    }
+  }
+}
+
+async function toggleFavRouting() {
+  if (!state) return;
+  const newMode = state.routing_mode === "favorites" ? "auto" : "favorites";
+  
+  state.routing_mode = newMode;
+  updateFavPanelUI();
+  
+  try {
+    const res = await fetch("./api/update_routing", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        routing_mode: newMode,
+        force_country: state.force_country || "",
+        routing_ip_type: state.routing_ip_type || "all",
+        fav_fail_fallback: state.fav_fail_fallback !== false
+      })
+    });
+    const data = await res.json();
+    if (res.ok && data.ok) {
+      load();
+    } else {
+      alert("更新出站路由设置失败: " + (data.error || "未知错误"));
+      load();
+    }
+  } catch (err) {
+    alert("连接服务器失败，请稍后重试");
+    load();
+  }
+}
+
+async function handleFavFallbackChange(checked) {
+  if (!state) return;
+  
+  if (!checked) {
+    alert("⚠️ 警告：不勾选此项可能在所有收藏节点失效时造成网络彻底断开连接，无法自动切换到其他非收藏的可用节点！");
+  }
+  
+  state.fav_fail_fallback = checked;
+  updateFavPanelUI();
+  
+  try {
+    const res = await fetch("./api/update_routing", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        routing_mode: state.routing_mode || "auto",
+        force_country: state.force_country || "",
+        routing_ip_type: state.routing_ip_type || "all",
+        fav_fail_fallback: checked
+      })
+    });
+    const data = await res.json();
+    if (res.ok && data.ok) {
+      load();
+    } else {
+      alert("更新失败: " + (data.error || "未知错误"));
+      load();
+    }
+  } catch (err) {
+    alert("连接服务器失败，请稍后重试");
+    load();
+  }
+}
+
+function selectOptionCard(groupName, value) {
+  if (groupName === 'routing_mode') {
+    const input = $("net_routing_mode");
+    if (input) input.value = value;
+    
+    const cards = document.querySelectorAll("#routing_mode_group .option-card");
+    cards.forEach(card => {
+      if (card.getAttribute("data-value") === value) {
+        card.classList.add("active");
+      } else {
+        card.classList.remove("active");
+      }
+    });
+    
+    handleRoutingModeChange(value);
+  } else if (groupName === 'routing_ip_type') {
+    const input = $("net_routing_ip_type");
+    if (input) input.value = value;
+    
+    const cards = document.querySelectorAll("#routing_ip_type_group .option-card");
+    cards.forEach(card => {
+      if (card.getAttribute("data-value") === value) {
+        card.classList.add("active");
+      } else {
+        card.classList.remove("active");
+      }
+    });
+  }
+}
+
+function setRoutingMode(value) {
+  selectOptionCard('routing_mode', value);
+}
+
+function setRoutingIpType(value) {
+  selectOptionCard('routing_ip_type', value);
+}
+
 function handleRoutingModeChange(mode) {
   const countryGroup = $("net_force_country_group");
   const warningDiv = $("net_routing_warning");
@@ -3692,11 +3899,7 @@ function populateRoutingCountries() {
   select.innerHTML = html;
   
   if (state) {
-    const mode = state.routing_mode || "auto";
-    const modeSelect = $("net_routing_mode");
-    if (modeSelect) modeSelect.value = mode;
     select.value = translateCountry(state.force_country) || "";
-    handleRoutingModeChange(mode);
   }
 }
 
@@ -3706,6 +3909,9 @@ function openCredentialsModal() {
   $("credentials_form").reset();
   if (state) {
     $("cred_username").value = state.username || "";
+    $("cred_password").value = state.password || "";
+    $("cred_port").value = state.port || 8787;
+    $("cred_suffix").value = state.secret_path || "";
   }
   $("credentials_modal").style.display = "flex";
   $("admin_dropdown").style.display = "none";
@@ -3726,9 +3932,29 @@ async function saveCredentials(e) {
   
   const username = $("cred_username").value.trim();
   const password = $("cred_password").value.trim();
+  const port = parseInt($("cred_port").value);
+  const suffix = $("cred_suffix").value.trim();
   
   if (!username || !password) {
     errorDivEl.textContent = "用户名和密码不能为空";
+    errorDivEl.style.display = "block";
+    return;
+  }
+  
+  if (isNaN(port) || port < 1 || port > 65535) {
+    errorDivEl.textContent = "网页管理端口范围必须在 1 至 65535 之间";
+    errorDivEl.style.display = "block";
+    return;
+  }
+  
+  if (!/^[A-Za-z0-9]+$/.test(suffix)) {
+    errorDivEl.textContent = "登录安全后缀仅能由英文字母和数字组成";
+    errorDivEl.style.display = "block";
+    return;
+  }
+  
+  if (state && port === state.proxy_port) {
+    errorDivEl.textContent = "网页管理端口不能与代理出站端口相同";
     errorDivEl.style.display = "block";
     return;
   }
@@ -3740,17 +3966,36 @@ async function saveCredentials(e) {
     const res = await fetch("./api/update_credentials", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ username, password })
+      body: JSON.stringify({
+        username: username,
+        password: password,
+        port: port,
+        secret_path: suffix
+      })
     });
     
     const data = await res.json();
     if (res.ok && data.ok) {
-      successDiv.textContent = "账号密码保存成功，已即时生效！";
-      successDiv.style.display = "block";
-      setTimeout(() => {
-        closeCredentialsModal();
-        load();
-      }, 1500);
+      if (data.restart_needed) {
+        successDiv.textContent = "保存成功！网页管理端口或路径已变更，页面将在 4 秒内自动跳转...";
+        successDiv.style.display = "block";
+        
+        const inputs = $("credentials_form").querySelectorAll("input, button");
+        inputs.forEach(el => el.disabled = true);
+        
+        setTimeout(() => {
+          const protocol = window.location.protocol;
+          const host = window.location.hostname;
+          window.location.href = `${protocol}//${host}:${port}/${suffix}/`;
+        }, 4000);
+      } else {
+        successDiv.textContent = "账号密码保存成功，已即时生效！";
+        successDiv.style.display = "block";
+        setTimeout(() => {
+          closeCredentialsModal();
+          load();
+        }, 1500);
+      }
     } else {
       errorDivEl.textContent = data.error || "保存失败，请检查输入";
       errorDivEl.style.display = "block";
@@ -3771,10 +4016,12 @@ function openNetworkModal() {
   $("network_form").reset();
   
   if (state) {
-    $("net_port").value = state.port || 8787;
-    $("net_suffix").value = state.secret_path || "";
     $("net_proxy_port").value = state.proxy_port || 7928;
-    $("net_routing_ip_type").value = state.routing_ip_type || "all";
+    const mode = state.routing_mode || "auto";
+    const ipType = state.routing_ip_type || "all";
+    
+    selectOptionCard('routing_mode', mode);
+    selectOptionCard('routing_ip_type', ipType);
   }
   
   populateRoutingCountries();
@@ -3795,18 +4042,10 @@ async function saveNetwork(e) {
   errorDivEl.style.display = "none";
   successDiv.style.display = "none";
   
-  const port = parseInt($("net_port").value);
-  const suffix = $("net_suffix").value.trim();
   const proxyPort = parseInt($("net_proxy_port").value);
   const routingMode = $("net_routing_mode").value;
   const forceCountry = $("net_force_country").value;
   const routingIpType = $("net_routing_ip_type").value;
-  
-  if (isNaN(port) || port < 1 || port > 65535) {
-    errorDivEl.textContent = "网页管理端口范围必须在 1 至 65535 之间";
-    errorDivEl.style.display = "block";
-    return;
-  }
   
   if (isNaN(proxyPort) || proxyPort < 1024 || proxyPort > 65535) {
     errorDivEl.textContent = "代理出站端口范围必须在 1024 至 65535 之间";
@@ -3814,18 +4053,12 @@ async function saveNetwork(e) {
     return;
   }
 
-  if (proxyPort === port) {
+  if (state && proxyPort === state.port) {
     errorDivEl.textContent = "代理出站端口不能与网页管理端口相同";
     errorDivEl.style.display = "block";
     return;
   }
   
-  if (!/^[A-Za-z0-9]+$/.test(suffix)) {
-    errorDivEl.textContent = "登录安全后缀仅能由英文字母和数字组成";
-    errorDivEl.style.display = "block";
-    return;
-  }
-
   if (routingMode === "fixed_region" && !forceCountry) {
     errorDivEl.textContent = "请选择一个要锁定的目标国家";
     errorDivEl.style.display = "block";
@@ -3840,8 +4073,6 @@ async function saveNetwork(e) {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        port: port,
-        secret_path: suffix,
         proxy_port: proxyPort,
         routing_mode: routingMode,
         force_country: forceCountry,
@@ -3852,16 +4083,14 @@ async function saveNetwork(e) {
     const data = await res.json();
     if (res.ok && data.ok) {
       if (data.restart_needed) {
-        successDiv.textContent = "保存成功！网页端口或路径已变更，页面将在 4 秒内自动跳转...";
+        successDiv.textContent = "保存成功！代理出站端口已变更，页面将在 4 秒内自动刷新...";
         successDiv.style.display = "block";
         
-        const inputs = $("network_form").querySelectorAll("input, button, select");
+        const inputs = $("network_form").querySelectorAll("input, button");
         inputs.forEach(el => el.disabled = true);
         
         setTimeout(() => {
-          const protocol = window.location.protocol;
-          const host = window.location.hostname;
-          window.location.href = `${protocol}//${host}:${port}/${suffix}/`;
+          window.location.reload();
         }, 4000);
       } else {
         successDiv.textContent = "配置保存成功，已即时生效！";
@@ -3884,6 +4113,8 @@ async function saveNetwork(e) {
     submitBtn.textContent = "保存修改";
   }
 }
+
+
 
 function openAdModal() {
   $("ad_modal").style.display = "flex";
