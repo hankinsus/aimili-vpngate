@@ -12,8 +12,8 @@ AimiliVPN 是一款基于官方 VPNGate 开放协议的高性能、零依赖 VPN
 ---
 
 ### 🌟 优选推荐：无需动手更省心
-[!![专线流媒体 顶级三网优化](https://yiy.one/register?codes=98BA33)]
-[!![无限流量住宅IP](https://www.miyaip.com/?invitecode=2955039)]
+[🎁[专线流媒体 顶级三网优化](https://yiy.one/register?codes=98BA33)]
+[📢[无限流量住宅IP](https://www.miyaip.com/?invitecode=2955039)]
 
 | 推荐 | 适合谁 | 亮点 | 入口 |
 | --- | --- | --- | --- |
