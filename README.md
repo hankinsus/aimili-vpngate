@@ -17,7 +17,7 @@ AimiliVPN 是一款基于官方 VPNGate 开放协议的高性能、零依赖 VPN
 
 | 推荐 | 适合谁 | 亮点 | 入口 |
 | --- | --- | --- | --- |
-| **BandwagonHost 搬瓦工** | 更看重国内访问质量、延迟和线路上限的用户 | **顶级三网优化线路**，适合对网络体验、跨境访问质量和长期稳定性要求更高的场景 | [立即查看](https://bandwagonhost.com/aff.php?aff=81790) |
+| **专线稳定流媒体** | 更看重国内访问质量、延迟和线路上限的用户 | **顶级三网优化线路**，解锁Open AI/Chat GPT、YouTube、Netflix、Disney+等适合对网络体验、跨境访问质量和长期稳定性要求更高的场景 | [立即查看](https://yiy.one/register?codes=98BA33)|
 | **RackNerd** | 想低成本部署、测试、长期挂机的用户 | **每月 6000GB 流量**，价格实惠、配置给得足，适合入门部署和性价比优先的 VPS 需求 | [立即查看](https://my.racknerd.com/aff.php?aff=18708) |
 
 ---
