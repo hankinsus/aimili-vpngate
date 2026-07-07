@@ -11,9 +11,9 @@ AimiliVPN 是一款基于官方 VPNGate 开放协议的高性能、零依赖 VPN
 
 ---
 
-### 🌟 VPS 优选推荐：跑 AimiliVPN 更稳更省心
-[![BandwagonHost 顶级三网优化](https://img.shields.io/badge/BandwagonHost-%E9%A1%B6%E7%BA%A7%E4%B8%89%E7%BD%91%E4%BC%98%E5%8C%96-red?style=for-the-badge)](https://bandwagonhost.com/aff.php?aff=81790)
-[![RackNerd 6000GB 流量](https://img.shields.io/badge/RackNerd-6000GB%2F%E6%9C%88%20%E5%A4%A7%E6%B5%81%E9%87%8F-blue?style=for-the-badge)](https://my.racknerd.com/aff.php?aff=18708)
+### 🌟 优选推荐：无需动手更省心
+[![专线流媒体 顶级三网优化](https://yiy.one/register?codes=98BA33)](https://bandwagonhost.com/aff.php?aff=81790)
+[![无限流量住宅IP](https://www.miyaip.com/?invitecode=2955039)
 
 | 推荐 | 适合谁 | 亮点 | 入口 |
 | --- | --- | --- | --- |
