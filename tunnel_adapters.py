@@ -203,6 +203,7 @@ class SoftEtherAdapter:
                 iface = f"vpn_{nic}"
             try:
                 subprocess.run(["ip", "addr", "flush", "dev", iface], capture_output=True, timeout=3)
+                subprocess.run(["ip", "link", "set", iface, "up"], capture_output=True, timeout=3)
             except Exception:
                 pass
             dhcp_ok, gateway = obtain_dhcp_lease(iface)
