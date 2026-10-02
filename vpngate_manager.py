@@ -78,6 +78,7 @@ class DualStackHTTPServer(ThreadingHTTPServer):
 import vpn_utils
 import proxy_server
 from node_pool import NodePool
+import tunnel_adapters
 
 def env_int(name: str, default: int, min_value: int | None = None, max_value: int | None = None) -> int:
     raw = os.environ.get(name)
@@ -5255,6 +5256,8 @@ class Handler(BaseHTTPRequestHandler):
                     del stripped["config_text"]
                 stripped_nodes.append(stripped)
             self.send_json({"nodes": stripped_nodes, "state": get_state()})
+        elif effective_path == "/api/protocol_capabilities":
+            self.send_json({"ok": True, "protocols": tunnel_adapters.capability_report()})
         elif effective_path == "/api/node_pool_stats":
             try:
                 self.send_json({"ok": True, "pool": node_pool.stats()})
