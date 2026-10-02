@@ -26,3 +26,102 @@ jobs:
               p = NodePool(Path(d) / "pool.sqlite3")
               print(p.stats())
           PY
+
+      - name: Master pool metadata and hot-pool smoke test
+        run: |
+          python3 - <<'PY'
+          import tempfile
+          from pathlib import Path
+          from node_pool import NodePool
+
+          with tempfile.TemporaryDirectory() as d:
+              pool = NodePool(Path(d) / "pool.sqlite3")
+              node = {
+                  "id": "US_198.51.100.10_1195_udp",
+                  "host_name": "vpn100.opengw.net",
+                  "ip": "198.51.100.10",
+                  "remote_host": "198.51.100.10",
+                  "remote_port": 1195,
+                  "proto": "udp",
+                  "config_file": "/tmp/test.ovpn",
+                  "ping": 80,
+                  "speed": 200_000_000,
+                  "sessions": 4,
+                  "score": 1000,
+                  "country": "美国",
+              }
+              pool.upsert_openvpn_snapshot([node])
+              pool.upsert_discovery_snapshot([
+                  {
+                      "hostname": "vpn100.opengw.net",
+                      "ip": "198.51.100.10",
+                      "country": "United States",
+                      "ping": 70,
+                      "speed": 300_000_000,
+                      "sessions": 3,
+                      "score": 1500,
+                      "protocols": [
+                          {"protocol": "openvpn", "transport": "udp", "port": 1195},
+                          {"protocol": "softether", "transport": "tcp", "port": 443},
+                      ],
+                  },
+                  {
+                      "hostname": "vpn200.opengw.net",
+                      "ip": "203.0.113.20",
+                      "country": "Japan",
+                      "ping": 45,
+                      "speed": 500_000_000,
+                      "sessions": 2,
+                      "score": 2000,
+                      "protocols": [
+                          {"protocol": "sstp", "transport": "tcp", "port": 443},
+                      ],
+                  },
+              ])
+
+              openvpn = pool.list_endpoints("openvpn", 10)[0]
+              assert openvpn["metadata"]["node_id"] == node["id"], openvpn
+
+              for _ in range(3):
+                  pool.record_probe(node, True, 80, "ok")
+              soft = pool.list_endpoints("softether", 10)[0]
+              sstp = pool.list_endpoints("sstp", 10)[0]
+              for _ in range(3):
+                  pool.record_endpoint_probe(soft["endpoint_id"], True, 60, "ok")
+                  pool.record_endpoint_probe(sstp["endpoint_id"], True, 45, "ok")
+
+              hot = pool.ranked_hot_pool(limit=3, per_server_limit=1)
+              assert hot, "hot pool empty"
+              assert len({e["server_key"] for e in hot}) == len(hot), hot
+              assert all("selection_score" in e for e in hot), hot
+              print([(e["protocol"], e["server_key"], e["selection_score"]) for e in hot])
+          PY
+      - name: VPNGate HTML protocol parser smoke test
+        run: |
+          python3 - <<'PY'
+          from vpngate_discovery import parse_server_table
+          html = """
+          <table><tr>
+            <td>United States</td>
+            <td><b>vpn123.opengw.net</b><span>198.51.100.9</span></td>
+            <td><b>3 sessions</b></td>
+            <td><b>200 Mbps</b> Ping: <b>50 ms</b></td>
+            <td>TCP: 443 UDP: Supported</td>
+            <td><a href="howto_l2tp.aspx">L2TP</a></td>
+            <td><a href="do_openvpn.aspx?fqdn=vpn123.opengw.net&ip=198.51.100.9&tcp=443&udp=1195">OpenVPN</a></td>
+            <td><a href="howto_sstp.aspx">SSTP</a> SSTP Hostname: vpn123.opengw.net:443</td>
+            <td>By test</td>
+            <td>1,234</td>
+          </tr></table>
+          """
+          rows = parse_server_table(html)
+          assert len(rows) == 1, rows
+          protocols = {(p["protocol"], p["transport"], p["port"]) for p in rows[0]["protocols"]}
+          assert ("softether", "tcp", 443) in protocols
+          assert ("softether", "udp", 443) in protocols
+          assert ("l2tp-ipsec", "udp", 0) in protocols
+          assert ("openvpn", "tcp", 443) in protocols
+          assert ("openvpn", "udp", 1195) in protocols
+          assert ("sstp", "tcp", 443) in protocols
+          print(protocols)
+          PY
