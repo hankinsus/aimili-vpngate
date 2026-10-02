@@ -1,0 +1,28 @@
+name: multi-protocol-branch-ci
+
+on:
+  push:
+    branches:
+      - multi-protocol-pool-v1
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  python-syntax:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile Python sources
+        run: |
+          python3 -m py_compile vpngate_manager.py proxy_server.py vpn_utils.py node_pool.py
+      - name: Import node pool
+        run: |
+          python3 - <<'PY'
+          import tempfile
+          from pathlib import Path
+          from node_pool import NodePool
+          with tempfile.TemporaryDirectory() as d:
+              p = NodePool(Path(d) / "pool.sqlite3")
+              print(p.stats())
+          PY
