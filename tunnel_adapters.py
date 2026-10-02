@@ -86,7 +86,7 @@ class SoftEtherAdapter:
         cmd = ["vpncmd", "localhost", "/CLIENT", "/CMD", *args]
         return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
 
-    def connect(self, host: str, port: int = 443, account: str = "aimili", nic: str = "aimili") -> TunnelResult:
+    def connect(self, host: str, port: int = 443, account: str = "aimili", nic: str = "aimili", username: str = "vpn", password: str = "vpn") -> TunnelResult:
         if not self.available():
             return TunnelResult(False, self.protocol, message="vpnclient/vpncmd not installed")
         before = list_interfaces()
@@ -101,13 +101,16 @@ class SoftEtherAdapter:
                 "AccountCreate", account,
                 f"/SERVER:{host}:{int(port)}",
                 "/HUB:VPNGATE",
-                "/USERNAME:vpn",
+                f"/USERNAME:{username}",
                 f"/NICNAME:{nic}",
                 timeout=10,
             )
             if created.returncode != 0:
                 return TunnelResult(False, self.protocol, message=(created.stdout + created.stderr)[-1200:])
-            self._vpncmd("AccountAnonymousSet", account, timeout=6)
+            auth = self._vpncmd("AccountPasswordSet", account, f"/PASSWORD:{password}", "/TYPE:standard", timeout=8)
+            if auth.returncode != 0:
+                self.disconnect(account)
+                return TunnelResult(False, self.protocol, message=(auth.stdout + auth.stderr)[-1200:])
             connected = self._vpncmd("AccountConnect", account, timeout=10)
             if connected.returncode != 0:
                 return TunnelResult(False, self.protocol, message=(connected.stdout + connected.stderr)[-1200:])
