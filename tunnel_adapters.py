@@ -572,6 +572,47 @@ exit 42
                 pass
 
     @staticmethod
+    def environment_report(run_kernel_test: bool = False) -> dict[str, Any]:
+        required = ("ip", "iptables", "unshare", "ipsec", "xl2tpd", "pppd", "curl", "mount")
+        missing = [cmd for cmd in required if not command_exists(cmd)]
+        report: dict[str, Any] = {
+            "root": os.geteuid() == 0,
+            "missing_commands": missing,
+            "netns_supported": Path("/proc/self/ns/net").exists(),
+            "mount_namespace_supported": Path("/proc/self/ns/mnt").exists(),
+            "kernel_test_ran": False,
+            "kernel_test_ok": None,
+            "kernel_test_error": "",
+        }
+        if run_kernel_test and report["root"] and not missing:
+            report["kernel_test_ran"] = True
+            test_ns = f"aimili-check-{os.getpid()}"
+            try:
+                subprocess.run(["ip", "netns", "del", test_ns], capture_output=True, timeout=3)
+                subprocess.run(["ip", "netns", "add", test_ns], capture_output=True, text=True, timeout=5, check=True)
+                subprocess.run(
+                    ["ip", "netns", "exec", test_ns, "unshare", "--mount", "--propagation", "private", "true"],
+                    capture_output=True, text=True, timeout=5, check=True,
+                )
+                report["kernel_test_ok"] = True
+            except Exception as exc:
+                report["kernel_test_ok"] = False
+                report["kernel_test_error"] = str(exc)
+            finally:
+                try:
+                    subprocess.run(["ip", "netns", "del", test_ns], capture_output=True, timeout=5)
+                except Exception:
+                    pass
+        report["ready"] = bool(
+            report["root"]
+            and not missing
+            and report["netns_supported"]
+            and report["mount_namespace_supported"]
+            and (report["kernel_test_ok"] is not False)
+        )
+        return report
+
+    @staticmethod
     def egress_check(result: TunnelResult, timeout: int = 7) -> dict[str, Any]:
         if not result.namespace or not result.inner_interface:
             return {"ok": False, "error": "L2TP namespace/interface missing"}
@@ -606,5 +647,9 @@ def capability_report() -> dict[str, Any]:
         "openvpn": {"installed": command_exists("openvpn"), "activation": "enabled"},
         "softether": {"installed": SoftEtherAdapter.available(), "activation": "development"},
         "sstp": {"installed": SSTPAdapter.available(), "activation": "development"},
-        "l2tp_ipsec": {"installed": L2TPIPsecAdapter.available(), "activation": "development-netns"},
+        "l2tp_ipsec": {
+            "installed": L2TPIPsecAdapter.available(),
+            "activation": "development-netns",
+            "environment": L2TPIPsecAdapter.environment_report(run_kernel_test=False),
+        },
     }
