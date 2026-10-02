@@ -355,12 +355,42 @@ class SSTPAdapter:
                 if proc.poll() is None:
                     proc.terminate()
                 return TunnelResult(False, self.protocol, message=output or "SSTP PPP interface was not created", process=proc)
-            if not interface_has_ipv4(iface):
-                time.sleep(2)
-            if not interface_has_ipv4(iface):
-                proc.terminate()
-                return TunnelResult(False, self.protocol, interface=iface, message="SSTP interface has no IPv4 address", process=proc)
-            return TunnelResult(True, self.protocol, interface=iface, message="SSTP connected", process=proc)
+            ip_deadline = time.time() + max(4.0, min(float(timeout), 15.0))
+            while time.time() < ip_deadline:
+                if interface_has_ipv4(iface):
+                    return TunnelResult(True, self.protocol, interface=iface, message="SSTP connected", process=proc)
+                if proc.poll() is not None:
+                    output = ""
+                    try:
+                        output = (proc.stdout.read() if proc.stdout else "")[-1800:]
+                    except Exception:
+                        pass
+                    return TunnelResult(
+                        False,
+                        self.protocol,
+                        interface=iface,
+                        message=output or "SSTP/PPP exited before IPv4 assignment",
+                        process=proc,
+                    )
+                time.sleep(0.5)
+
+            output = ""
+            try:
+                if proc.stdout:
+                    import select
+                    ready, _, _ = select.select([proc.stdout], [], [], 0)
+                    if ready:
+                        output = proc.stdout.read(1800) or ""
+            except Exception:
+                pass
+            proc.terminate()
+            return TunnelResult(
+                False,
+                self.protocol,
+                interface=iface,
+                message=f"SSTP PPP interface has no IPv4 address after wait. {output[-1500:]}",
+                process=proc,
+            )
         except Exception as exc:
             return TunnelResult(False, self.protocol, message=str(exc))
 
