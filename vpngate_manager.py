@@ -118,6 +118,7 @@ INITIAL_CONNECT_TEST_LIMIT = env_int("INITIAL_CONNECT_TEST_LIMIT", 10, 1, 50)
 BACKGROUND_PROBE_BATCH = env_int("BACKGROUND_PROBE_BATCH", 40, 5, 200)
 PROTOCOL_PROBE_BATCH = env_int("PROTOCOL_PROBE_BATCH", 3, 1, 10)
 PROTOCOL_PROBE_INTERVAL_SECONDS = env_int("PROTOCOL_PROBE_INTERVAL_SECONDS", 300, 60, 3600)
+HOT_POOL_TARGET = env_int("HOT_POOL_TARGET", 8, 5, 10)
 LINK_PROBE_MAX_BYTES = env_int("LINK_PROBE_MAX_BYTES", 1048576, 65536, 4194304)
 LINK_PROBE_WINDOW_BYTES = env_int("LINK_PROBE_WINDOW_BYTES", 4194304, 262144, 16777216)
 LINK_PROBE_WINDOW_SECONDS = env_int("LINK_PROBE_WINDOW_SECONDS", 60, 10, 300)
@@ -2068,10 +2069,23 @@ def protocol_probe_loop() -> None:
             if is_connecting:
                 time.sleep(15)
                 continue
-            limit = 2 if active_tunnel_running() else PROTOCOL_PROBE_BATCH
+            current_hot = node_pool.ranked_hot_pool(limit=HOT_POOL_TARGET, per_server_limit=2)
+            deficit = max(0, HOT_POOL_TARGET - len(current_hot))
+            if deficit > 0:
+                desired = min(PROTOCOL_PROBE_BATCH, max(1, deficit))
+                limit = min(2, desired) if active_tunnel_running() else desired
+            else:
+                # Pool is healthy: validate only one due non-OpenVPN endpoint
+                # per cycle so new protocol resources still get a chance.
+                limit = 1
             due = node_pool.due_endpoints(("softether", "sstp", "l2tp-ipsec"), limit=limit)
+            set_state(hot_pool_size=len(current_hot), hot_pool_target=HOT_POOL_TARGET)
             if due:
-                log_to_json("INFO", "Probe", f"多协议热备低频探测，本轮 {len(due)} 个端点")
+                log_to_json(
+                    "INFO",
+                    "Probe",
+                    f"多协议热备低频探测，本轮 {len(due)} 个端点，Hot Pool {len(current_hot)}/{HOT_POOL_TARGET}",
+                )
             for endpoint in due:
                 if is_connecting:
                     break
@@ -5744,7 +5758,13 @@ class Handler(BaseHTTPRequestHandler):
                 query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
                 limit = bounded_int((query.get("limit") or ["10"])[0], 10, 1, 20)
                 pool = node_pool.ranked_hot_pool(limit=limit, per_server_limit=2)
-                self.send_json({"ok": True, "hot_pool": pool, "count": len(pool)})
+                self.send_json({
+                    "ok": True,
+                    "hot_pool": pool,
+                    "count": len(pool),
+                    "target": HOT_POOL_TARGET,
+                    "deficit": max(0, HOT_POOL_TARGET - len(pool)),
+                })
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         elif effective_path == "/api/link_probe":
@@ -6259,6 +6279,17 @@ class Handler(BaseHTTPRequestHandler):
                     active_node_latency="无活动连接",
                 )
                 self.send_json({"ok": True})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+        elif effective_path == "/api/protocol_selftest":
+            try:
+                self.read_request_body()
+                l2tp = tunnel_adapters.L2TPIPsecAdapter.environment_report(run_kernel_test=True)
+                self.send_json({
+                    "ok": bool(l2tp.get("ready")),
+                    "l2tp_ipsec": l2tp,
+                    "protocols": tunnel_adapters.capability_report(),
+                }, HTTPStatus.OK if l2tp.get("ready") else HTTPStatus.SERVICE_UNAVAILABLE)
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         elif effective_path == "/api/refresh_protocol_catalog":
