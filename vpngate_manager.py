@@ -2262,6 +2262,15 @@ def maintain_valid_nodes(force: bool = False) -> str:
                         is_connecting = False
                         auto_switch_node()
                         is_connecting = True
+                    elif routing_mode in ("auto", "fixed_region"):
+                        # Warm-start from persisted validated endpoints before
+                        # doing a fresh network-wide scan.
+                        is_connecting = False
+                        try:
+                            if try_unified_failover(attempts=3):
+                                log_to_json("INFO", "VPN", "已从持久化 Hot Pool 快速恢复生产出口")
+                        finally:
+                            is_connecting = True
 
         try:
             set_state(is_connecting=True, last_check_message="正在拉取最新的免费 VPN 节点列表...")
