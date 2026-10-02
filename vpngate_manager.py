@@ -118,6 +118,9 @@ INITIAL_CONNECT_TEST_LIMIT = env_int("INITIAL_CONNECT_TEST_LIMIT", 10, 1, 50)
 BACKGROUND_PROBE_BATCH = env_int("BACKGROUND_PROBE_BATCH", 40, 5, 200)
 PROTOCOL_PROBE_BATCH = env_int("PROTOCOL_PROBE_BATCH", 3, 1, 10)
 PROTOCOL_PROBE_INTERVAL_SECONDS = env_int("PROTOCOL_PROBE_INTERVAL_SECONDS", 300, 60, 3600)
+LINK_PROBE_MAX_BYTES = env_int("LINK_PROBE_MAX_BYTES", 1048576, 65536, 4194304)
+LINK_PROBE_WINDOW_BYTES = env_int("LINK_PROBE_WINDOW_BYTES", 4194304, 262144, 16777216)
+LINK_PROBE_WINDOW_SECONDS = env_int("LINK_PROBE_WINDOW_SECONDS", 60, 10, 300)
 OPENVPN_CMD = os.environ.get("OPENVPN_CMD", "openvpn")
 OPENVPN_AUTH_USER = os.environ.get("OPENVPN_AUTH_USER", "vpn")
 OPENVPN_AUTH_PASS = os.environ.get("OPENVPN_AUTH_PASS", "vpn")
@@ -147,6 +150,8 @@ active_external_tunnel: tunnel_adapters.TunnelResult | None = None
 active_pool_endpoint_id = ""
 protocol_discovery_lock = threading.Lock()
 protocol_probe_lock = threading.Lock()
+link_probe_lock = threading.Lock()
+link_probe_usage: dict[str, tuple[float, int]] = {}
 last_protocol_discovery_at = 0.0
 is_connecting = False
 last_active_ping_time = 0.0
@@ -5220,6 +5225,53 @@ function exportLogContent() {
 </script>
 </body></html>"""
 
+def local_proxy_port_reachable(timeout: float = 0.4) -> bool:
+    host = LOCAL_PROXY_HOST
+    candidates: list[tuple[int, str]] = []
+    if host in ("::", ""):
+        candidates = [(socket.AF_INET6, "::1"), (socket.AF_INET, "127.0.0.1")]
+    elif host == "0.0.0.0":
+        candidates = [(socket.AF_INET, "127.0.0.1")]
+    elif ":" in host:
+        candidates = [(socket.AF_INET6, host), (socket.AF_INET, "127.0.0.1")]
+    else:
+        candidates = [(socket.AF_INET, host)]
+    for af, target in candidates:
+        s = None
+        try:
+            s = socket.socket(af, socket.SOCK_STREAM)
+            s.settimeout(timeout)
+            s.connect((target, LOCAL_PROXY_PORT))
+            return True
+        except Exception:
+            pass
+        finally:
+            if s is not None:
+                try:
+                    s.close()
+                except Exception:
+                    pass
+    return False
+
+def reserve_link_probe_bytes(client_ip: str, requested: int) -> tuple[bool, int]:
+    now = time.time()
+    requested = max(0, int(requested))
+    with link_probe_lock:
+        started, used = link_probe_usage.get(client_ip, (now, 0))
+        if now - started >= LINK_PROBE_WINDOW_SECONDS:
+            started, used = now, 0
+        if used + requested > LINK_PROBE_WINDOW_BYTES:
+            retry_after = max(1, int(LINK_PROBE_WINDOW_SECONDS - (now - started)))
+            link_probe_usage[client_ip] = (started, used)
+            return False, retry_after
+        link_probe_usage[client_ip] = (started, used + requested)
+        # Opportunistic cleanup so the dict cannot grow forever.
+        if len(link_probe_usage) > 2048:
+            stale = [ip for ip, (ts, _) in link_probe_usage.items() if now - ts > LINK_PROBE_WINDOW_SECONDS * 2]
+            for ip in stale[:1024]:
+                link_probe_usage.pop(ip, None)
+        return True, 0
+
 def check_proxy_health() -> dict[str, Any]:
     # 1. 检测代理服务端口是否在监听
     is_ipv6 = ":" in LOCAL_PROXY_HOST
@@ -5603,24 +5655,39 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         elif effective_path == "/api/link_probe":
-            # This endpoint is intentionally authenticated. The remote client can
-            # measure RTT from request/response timing; server data reports the
-            # production proxy/tunnel state seen at the same moment.
+            # Client measures HTTP RTT externally. The response separates that
+            # client-to-server metric from local 7928 and VPN egress health.
             state = get_state()
             self.send_json({
                 "ok": True,
                 "server_time": time.time(),
                 "proxy_host": LOCAL_PROXY_HOST,
                 "proxy_port": LOCAL_PROXY_PORT,
+                "proxy_port_reachable": local_proxy_port_reachable(),
                 "proxy_ok": bool(state.get("proxy_ok")),
                 "proxy_latency_ms": parse_int(state.get("proxy_latency_ms")),
-                "active_tunnel_protocol": state.get("active_tunnel_protocol", "openvpn"),
-                "active_tunnel_interface": proxy_server.get_active_interface(),
+                "active_tunnel_protocol": state.get("active_tunnel_protocol", ""),
+                "active_tunnel_interface": proxy_server.get_active_interface() if active_tunnel_running() else "",
                 "active_node_id": active_openvpn_node_id,
+                "active_pool_endpoint_id": active_pool_endpoint_id,
+                "pool": node_pool.stats(),
             })
         elif effective_path == "/api/link_probe_payload":
             query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
-            requested = bounded_int((query.get("bytes") or ["262144"])[0], 262144, 1024, 1048576)
+            requested = bounded_int(
+                (query.get("bytes") or ["262144"])[0],
+                262144,
+                1024,
+                LINK_PROBE_MAX_BYTES,
+            )
+            client_ip = str(self.client_address[0] if self.client_address else "unknown")
+            allowed, retry_after = reserve_link_probe_bytes(client_ip, requested)
+            if not allowed:
+                self.send_json(
+                    {"ok": False, "error": "测速请求过于频繁", "retry_after_seconds": retry_after},
+                    HTTPStatus.TOO_MANY_REQUESTS,
+                )
+                return
             self.send_bytes(b"0" * requested, "application/octet-stream")
         elif effective_path.startswith("/configs/"):
             filename = urllib.parse.unquote(effective_path.removeprefix("/configs/"))
