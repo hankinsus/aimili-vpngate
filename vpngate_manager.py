@@ -1748,6 +1748,15 @@ def maintain_valid_nodes(force: bool = False) -> str:
         try:
             set_state(is_connecting=True, last_check_message="正在拉取最新的免费 VPN 节点列表...")
             candidates = fetch_candidates()
+            # Enrich all fetched candidates before expensive OpenVPN probing so
+            # residential/mobile/hosting routing can prioritize the right nodes.
+            # ip-api batch supports many IPs per request and the local cache avoids
+            # repeating lookups on every maintenance cycle.
+            try:
+                vpn_utils.enrich_ip_info(candidates)
+            except Exception as enrich_exc:
+                print(f"[候选节点富化] 批量查询 IP 属性失败，继续执行连通性检测: {enrich_exc}", flush=True)
+                log_to_json("WARNING", "Main", f"候选节点 IP 属性查询失败: {enrich_exc}")
         except Exception as exc:
             vpn_utils.check_and_fix_dns()
             diag_msg = str(exc)
@@ -1782,11 +1791,18 @@ def maintain_valid_nodes(force: bool = False) -> str:
                 if cand["id"] not in seen_ids:
                     previous = current_by_id.get(str(cand["id"]))
                     if previous:
+                        # Keep prior probe state, but prefer freshly enriched ISP/IP
+                        # metadata from the latest fetch. This prevents stale cached
+                        # classifications from overwriting a newly corrected result.
                         for key in [
                             "probe_status",
                             "probe_message",
                             "latency_ms",
                             "probed_at",
+                        ]:
+                            if previous.get(key) not in (None, ""):
+                                cand[key] = previous.get(key)
+                        for key in [
                             "owner",
                             "asn",
                             "as_name",
@@ -1794,7 +1810,7 @@ def maintain_valid_nodes(force: bool = False) -> str:
                             "ip_type",
                             "quality",
                         ]:
-                            if previous.get(key) not in (None, ""):
+                            if cand.get(key) in (None, "") and previous.get(key) not in (None, ""):
                                 cand[key] = previous.get(key)
                     merged.append(cand)
                     seen_ids.add(cand["id"])
