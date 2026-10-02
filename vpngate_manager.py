@@ -1476,6 +1476,8 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
 
     updated_nodes_map = {}
     max_workers = min(5, max(1, len(to_test)))
+    completed_since_flush = 0
+    last_flush_at = time.time()
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(test_worker, (idx, n)): n["id"] for idx, n in enumerate(to_test)}
         for future in concurrent.futures.as_completed(futures):
@@ -1490,13 +1492,22 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
                     "probe_message": f"Test exception: {e}",
                     "latency_ms": 0
                 }
-            with lock:
-                current_nodes = read_nodes()
-                for n in current_nodes:
-                    if n.get("id") == nid:
-                        n.update(updated_nodes_map[nid])
-                        break
-                write_json(NODES_FILE, sort_all_nodes(current_nodes))
+
+            # Avoid re-reading and rewriting the entire nodes.json after every
+            # single probe completion. Flush small batches so the UI remains
+            # responsive without turning disk I/O into an O(n^2) bottleneck.
+            completed_since_flush += 1
+            now = time.time()
+            if completed_since_flush >= 5 or now - last_flush_at >= 1.0:
+                with lock:
+                    current_nodes = read_nodes()
+                    for current in current_nodes:
+                        current_id = current.get("id")
+                        if current_id in updated_nodes_map:
+                            current.update(updated_nodes_map[current_id])
+                    write_json(NODES_FILE, sort_all_nodes(current_nodes))
+                completed_since_flush = 0
+                last_flush_at = now
                 
     # 批量查询并丰富可用节点的地理及 ISP 信息，防止并发时被定位 API 接口限流
     successful_nodes = [res for res in updated_nodes_map.values() if res.get("probe_status") == "available"]
