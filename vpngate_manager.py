@@ -2074,16 +2074,30 @@ def check_interface_egress(interface: str, gateway: str = "") -> dict[str, Any]:
         return {"ok": False, "error": f"临时策略路由建立失败: {route_error}"}
 
     cmd = [
-        "curl", "-s",
+        "curl", "-4", "-sS",
         "--interface", f"if!{interface}",
         "-w", "\n%{time_total} %{http_code}",
-        "http://api.ipify.org",
-        "--max-time", "6",
+        "https://api.ipify.org",
+        "--connect-timeout", "4",
+        "--max-time", "8",
     ]
     try:
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=7)
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=9)
         if res.returncode != 0:
-            return {"ok": False, "error": (res.stderr or f"curl exit {res.returncode}")[-500:]}
+            diagnostics: list[str] = [f"curl_exit={res.returncode}", f"gateway={gateway or '-'}"]
+            if res.stderr:
+                diagnostics.append(f"curl_error={res.stderr.strip()[-500:]}")
+            for label, diag_cmd in [
+                ("addr", ["ip", "-4", "addr", "show", "dev", interface]),
+                ("table200", ["ip", "route", "show", "table", str(PROBE_ROUTE_TABLE)]),
+                ("route_get", ["ip", "route", "get", "1.1.1.1", "oif", interface]),
+            ]:
+                try:
+                    diag = subprocess.run(diag_cmd, capture_output=True, text=True, timeout=3)
+                    diagnostics.append(f"{label}={(diag.stdout or diag.stderr).strip()[-700:]}")
+                except Exception as exc:
+                    diagnostics.append(f"{label}_error={exc}")
+            return {"ok": False, "error": " | ".join(diagnostics)}
         lines = res.stdout.strip().splitlines()
         if len(lines) < 2:
             return {"ok": False, "error": "测试出口没有返回有效结果"}
