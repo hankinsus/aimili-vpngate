@@ -1234,13 +1234,17 @@ def refresh_multi_protocol_catalog(force: bool = False) -> dict[str, Any]:
     if not protocol_discovery_lock.acquire(blocking=False):
         return {"ok": True, "running": True, "pool": node_pool.stats()}
     try:
-        servers = vpngate_discovery.fetch_server_table(timeout=15)
-        node_pool.upsert_discovery_snapshot(servers, source="official_html")
+        servers, sources = vpngate_discovery.fetch_multi_source_tables(max_mirrors=2)
+        node_pool.upsert_discovery_snapshot(servers, source="official_html_multi")
         last_protocol_discovery_at = time.time()
         stats = node_pool.stats()
-        set_state(protocol_catalog_last_at=last_protocol_discovery_at, protocol_catalog_count=len(servers))
-        log_to_json("INFO", "Main", f"多协议目录刷新完成，本轮发现 {len(servers)} 台服务器，Master Pool={stats}")
-        return {"ok": True, "servers": len(servers), "pool": stats}
+        set_state(
+            protocol_catalog_last_at=last_protocol_discovery_at,
+            protocol_catalog_count=len(servers),
+            protocol_catalog_sources=len(sources),
+        )
+        log_to_json("INFO", "Main", f"多协议目录刷新完成，本轮合并 {len(servers)} 台服务器，来源 {len(sources)} 个，Master Pool={stats}")
+        return {"ok": True, "servers": len(servers), "sources": sources, "pool": stats}
     except Exception as exc:
         log_to_json("WARNING", "Main", f"多协议目录刷新失败: {exc}")
         return {"ok": False, "error": str(exc), "pool": node_pool.stats()}
