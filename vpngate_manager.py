@@ -1385,7 +1385,7 @@ def connect_pool_endpoint(endpoint_id: str) -> str:
         direct_health = (
             tunnel_adapters.L2TPIPsecAdapter.egress_check(result)
             if protocol == "l2tp-ipsec"
-            else check_interface_egress(result.interface)
+            else check_interface_egress(result.interface, result.gateway)
         )
         if not direct_health.get("ok"):
             message = str(direct_health.get("error") or "候选隧道出口检测失败")
@@ -2028,10 +2028,51 @@ def connect_node(node_id: str) -> str:
         with lock:
             is_connecting = False
 
-def check_interface_egress(interface: str) -> dict[str, Any]:
+PROBE_ROUTE_TABLE = 200
+
+def cleanup_probe_policy_routing(table: int = PROBE_ROUTE_TABLE) -> None:
+    try:
+        subprocess.run(["ip", "rule", "del", "table", str(table)], capture_output=True, timeout=2)
+    except Exception:
+        pass
+    try:
+        subprocess.run(["ip", "route", "flush", "table", str(table)], capture_output=True, timeout=2)
+    except Exception:
+        pass
+
+def setup_probe_policy_routing(interface: str, gateway: str = "", table: int = PROBE_ROUTE_TABLE) -> tuple[bool, str]:
+    interface = str(interface or "").strip()
+    gateway = str(gateway or "").strip()
+    if not interface:
+        return False, "缺少测试网卡"
+    cleanup_probe_policy_routing(table)
+    try:
+        route_cmd = ["ip", "route", "add", "default"]
+        if gateway:
+            route_cmd.extend(["via", gateway])
+        route_cmd.extend(["dev", interface])
+        if gateway:
+            route_cmd.append("onlink")
+        route_cmd.extend(["table", str(table)])
+        subprocess.run(route_cmd, capture_output=True, text=True, check=True, timeout=3)
+        subprocess.run(
+            ["ip", "rule", "add", "oif", interface, "table", str(table)],
+            capture_output=True, text=True, check=True, timeout=3,
+        )
+        return True, ""
+    except Exception as exc:
+        cleanup_probe_policy_routing(table)
+        return False, str(exc)
+
+def check_interface_egress(interface: str, gateway: str = "") -> dict[str, Any]:
     interface = str(interface or "").strip()
     if not interface:
         return {"ok": False, "error": "缺少测试网卡"}
+
+    route_ok, route_error = setup_probe_policy_routing(interface, gateway)
+    if not route_ok:
+        return {"ok": False, "error": f"临时策略路由建立失败: {route_error}"}
+
     cmd = [
         "curl", "-s",
         "--interface", f"if!{interface}",
@@ -2054,6 +2095,8 @@ def check_interface_egress(interface: str) -> dict[str, Any]:
         return {"ok": True, "ip": ip, "latency_ms": latency_ms}
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
+    finally:
+        cleanup_probe_policy_routing()
 
 def probe_pool_endpoint(endpoint_id: str) -> dict[str, Any]:
     endpoint_id = str(endpoint_id or "").strip()
