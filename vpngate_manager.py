@@ -1225,7 +1225,12 @@ def stop_active_external_tunnel() -> None:
         return
     try:
         if tunnel.protocol == "softether":
-            tunnel_adapters.SoftEtherAdapter().disconnect()
+            details = tunnel.details or {}
+            tunnel_adapters.SoftEtherAdapter().disconnect(
+                account=str(details.get("account") or "aimili"),
+                nic=str(details.get("nic") or "aimili"),
+                delete=True,
+            )
         elif tunnel.protocol == "sstp":
             tunnel_adapters.SSTPAdapter.disconnect(tunnel.process)
         elif tunnel.protocol == "l2tp-ipsec":
@@ -1277,15 +1282,44 @@ def connect_pool_endpoint(endpoint_id: str) -> str:
     if protocol not in ("softether", "sstp", "l2tp-ipsec"):
         raise RuntimeError(f"协议 {protocol} 当前尚未开放生产连接")
 
+    if protocol == "softether" and not tunnel_adapters.SoftEtherAdapter.available():
+        raise RuntimeError("SoftEther 客户端组件未安装")
+    if protocol == "sstp" and not tunnel_adapters.SSTPAdapter.available():
+        raise RuntimeError("SSTP 客户端组件未安装")
+    if protocol == "l2tp-ipsec":
+        l2tp_env = tunnel_adapters.L2TPIPsecAdapter.environment_report(run_kernel_test=False)
+        if not l2tp_env.get("ready"):
+            raise RuntimeError(f"L2TP/IPsec 隔离环境未就绪: {l2tp_env}")
+
     with lock:
         if is_connecting:
             raise RuntimeError("当前已有连接或节点检测任务正在运行，请稍后再试")
         is_connecting = True
 
-    started = time.time()
+    result: tunnel_adapters.TunnelResult | None = None
+    promoted = False
+    token = re.sub(r"[^a-z0-9]", "", endpoint_id.lower())[:8] or uuid.uuid4().hex[:8]
+
+    def cleanup_new() -> None:
+        if result is None:
+            return
+        try:
+            if result.protocol == "softether":
+                details = result.details or {}
+                tunnel_adapters.SoftEtherAdapter().disconnect(
+                    account=str(details.get("account") or f"prod{token}"),
+                    nic=str(details.get("nic") or f"a{token}"),
+                    delete=True,
+                )
+            elif result.protocol == "sstp":
+                tunnel_adapters.SSTPAdapter.disconnect(result.process)
+            elif result.protocol == "l2tp-ipsec":
+                l2tp_adapter.disconnect(result.namespace)
+        except Exception:
+            pass
+
     try:
-        set_state(is_connecting=True, last_check_message=f"正在连接 {protocol} 端点 {endpoint_id}")
-        stop_all_tunnels()
+        set_state(is_connecting=True, last_check_message=f"正在预连接并验证 {protocol} 端点 {endpoint_id}")
 
         metadata = endpoint.get("metadata") or {}
         host = str(metadata.get("hostname") or endpoint.get("hostname") or endpoint.get("current_ip") or "").strip()
@@ -1293,12 +1327,14 @@ def connect_pool_endpoint(endpoint_id: str) -> str:
             raise RuntimeError("端点缺少可连接的 Hostname/IP")
         port = parse_int(endpoint.get("port"))
 
+        # Make-before-break: establish a completely separate candidate tunnel
+        # while the existing production 7928 path continues serving traffic.
         if protocol == "softether":
             result = tunnel_adapters.SoftEtherAdapter().connect(
                 host=host,
                 port=port or 443,
-                account="aimili",
-                nic="aimili",
+                account=f"prod{token}",
+                nic=f"a{token}",
                 username="vpn",
                 password="vpn",
             )
@@ -1315,7 +1351,7 @@ def connect_pool_endpoint(endpoint_id: str) -> str:
                 username="vpn",
                 password="vpn",
                 psk="vpn",
-                namespace="aimili-l2tp-prod",
+                namespace=f"aimili-l2tp-{token}",
                 timeout=35,
             )
 
@@ -1323,19 +1359,36 @@ def connect_pool_endpoint(endpoint_id: str) -> str:
             node_pool.record_endpoint_probe(endpoint_id, False, 0, result.message)
             raise RuntimeError(result.message or f"{protocol} 连接失败")
 
+        direct_health = (
+            tunnel_adapters.L2TPIPsecAdapter.egress_check(result)
+            if protocol == "l2tp-ipsec"
+            else check_interface_egress(result.interface)
+        )
+        if not direct_health.get("ok"):
+            message = str(direct_health.get("error") or "候选隧道出口检测失败")
+            node_pool.record_endpoint_probe(endpoint_id, False, 0, message)
+            raise RuntimeError(message)
+
+        # Candidate is independently verified. Only now release the old tunnel.
+        if active_external_tunnel is not None:
+            stop_active_external_tunnel()
+        if active_openvpn_running():
+            stop_active_openvpn()
+
         active_external_tunnel = result
         active_pool_endpoint_id = endpoint_id
         active_openvpn_node_id = ""
         proxy_server.set_active_interface(result.interface)
         setup_policy_routing(result.interface, gateway=result.gateway)
+        promoted = True
 
         health = check_proxy_health()
         if not health.get("ok"):
-            node_pool.record_endpoint_probe(endpoint_id, False, 0, str(health.get("error") or "代理出口检测失败"))
+            node_pool.record_endpoint_probe(endpoint_id, False, 0, str(health.get("error") or "7928 代理出口检测失败"))
             stop_active_external_tunnel()
-            raise RuntimeError(str(health.get("error") or "代理出口检测失败"))
+            raise RuntimeError(str(health.get("error") or "7928 代理出口检测失败"))
 
-        latency = parse_int(health.get("latency_ms"))
+        latency = parse_int(health.get("latency_ms")) or parse_int(direct_health.get("latency_ms"))
         node_pool.record_endpoint_probe(endpoint_id, True, latency, "production connect ok")
         set_state(
             active_pool_endpoint_id=endpoint_id,
@@ -1348,9 +1401,15 @@ def connect_pool_endpoint(endpoint_id: str) -> str:
             is_connecting=False,
             last_check_message=f"Connected {protocol} {endpoint_id}",
         )
-        log_to_json("INFO", "VPN", f"{protocol} 连接成功，接口 {result.interface}，7928 出口正常")
+        log_to_json(
+            "INFO",
+            "VPN",
+            f"{protocol} 候选隧道验证成功后接管 7928，接口 {result.interface}",
+        )
         return f"Connected {protocol} endpoint {endpoint_id}"
     except Exception:
+        if not promoted:
+            cleanup_new()
         raise
     finally:
         is_connecting = False
