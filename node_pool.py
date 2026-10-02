@@ -110,6 +110,18 @@ class NodePool:
                     "sessions": int(server.get("sessions") or 0),
                     "score": int(server.get("score") or 0),
                 }
+                existing_server = db.execute(
+                    "SELECT metadata_json FROM servers WHERE server_key=?",
+                    (key,),
+                ).fetchone()
+                if existing_server:
+                    try:
+                        previous_meta = json.loads(existing_server["metadata_json"] or "{}")
+                        if isinstance(previous_meta, dict):
+                            previous_meta.update({k: v for k, v in metadata.items() if v not in (None, "")})
+                            metadata = previous_meta
+                    except Exception:
+                        pass
                 db.execute(
                     """
                     INSERT INTO servers(server_key, hostname, current_ip, country, first_seen, last_seen, last_source, missing_count, state, metadata_json)
@@ -142,6 +154,18 @@ class NodePool:
                         "ip": ip,
                         "source": source,
                     }
+                    existing_endpoint = db.execute(
+                        "SELECT metadata_json FROM endpoints WHERE endpoint_id=?",
+                        (eid,),
+                    ).fetchone()
+                    if existing_endpoint:
+                        try:
+                            previous_endpoint_meta = json.loads(existing_endpoint["metadata_json"] or "{}")
+                            if isinstance(previous_endpoint_meta, dict):
+                                previous_endpoint_meta.update({k: v for k, v in endpoint_meta.items() if v not in (None, "")})
+                                endpoint_meta = previous_endpoint_meta
+                        except Exception:
+                            pass
                     db.execute(
                         """
                         INSERT INTO endpoints(endpoint_id, server_key, protocol, transport, port, status, first_seen, last_seen, metadata_json)
@@ -242,6 +266,18 @@ class NodePool:
                     "ip_type": node.get("ip_type", ""),
                     "quality": node.get("quality", ""),
                 }
+                existing_server = db.execute(
+                    "SELECT metadata_json FROM servers WHERE server_key=?",
+                    (key,),
+                ).fetchone()
+                if existing_server:
+                    try:
+                        previous_meta = json.loads(existing_server["metadata_json"] or "{}")
+                        if isinstance(previous_meta, dict):
+                            previous_meta.update({k: v for k, v in meta.items() if v not in (None, "")})
+                            meta = previous_meta
+                    except Exception:
+                        pass
                 db.execute(
                     """
                     INSERT INTO servers(server_key, hostname, current_ip, country, first_seen, last_seen, last_source, missing_count, state, metadata_json)
@@ -267,6 +303,18 @@ class NodePool:
                     "node_id": node.get("id", ""),
                     "config_file": node.get("config_file", ""),
                 }
+                existing_endpoint = db.execute(
+                    "SELECT metadata_json FROM endpoints WHERE endpoint_id=?",
+                    (eid,),
+                ).fetchone()
+                if existing_endpoint:
+                    try:
+                        previous_endpoint_meta = json.loads(existing_endpoint["metadata_json"] or "{}")
+                        if isinstance(previous_endpoint_meta, dict):
+                            previous_endpoint_meta.update({k: v for k, v in endpoint_meta.items() if v not in (None, "")})
+                            endpoint_meta = previous_endpoint_meta
+                    except Exception:
+                        pass
                 db.execute(
                     """
                     INSERT INTO endpoints(endpoint_id, server_key, protocol, transport, port, config_ref, status, first_seen, last_seen, metadata_json)
