@@ -226,6 +226,8 @@ def merge_servers(snapshots: list[list[dict[str, Any]]]) -> list[dict[str, Any]]
             if existing is None:
                 cloned = dict(server)
                 cloned["protocols"] = [dict(p) for p in (server.get("protocols") or [])]
+                source_url = str(server.get("_source_url") or "")
+                cloned["_sources"] = [source_url] if source_url else []
                 merged[key] = cloned
                 continue
 
@@ -234,6 +236,10 @@ def merge_servers(snapshots: list[list[dict[str, Any]]]) -> list[dict[str, Any]]
                 value = server.get(field)
                 if value not in (None, "", 0):
                     existing[field] = value
+
+            source_url = str(server.get("_source_url") or "")
+            if source_url and source_url not in existing.setdefault("_sources", []):
+                existing["_sources"].append(source_url)
 
             protocol_keys = {
                 (
@@ -254,7 +260,15 @@ def merge_servers(snapshots: list[list[dict[str, Any]]]) -> list[dict[str, Any]]
                 if pkey not in protocol_keys:
                     existing.setdefault("protocols", []).append(dict(endpoint))
                     protocol_keys.add(pkey)
-    return list(merged.values())
+    result = list(merged.values())
+    for server in result:
+        sources = [str(s) for s in (server.get("_sources") or []) if s]
+        server["source_count"] = len(sources)
+        server["trusted_observation"] = (
+            VPNGATE_HTML_URL in sources
+            or len(set(sources)) >= 2
+        )
+    return result
 
 def fetch_multi_source_tables(max_mirrors: int = 2) -> tuple[list[dict[str, Any]], list[str]]:
     sources = [VPNGATE_HTML_URL]
@@ -270,6 +284,8 @@ def fetch_multi_source_tables(max_mirrors: int = 2) -> tuple[list[dict[str, Any]
         try:
             servers = fetch_server_table(source, timeout=12)
             if servers:
+                for server in servers:
+                    server["_source_url"] = source
                 snapshots.append(servers)
                 successful_sources.append(source)
         except Exception:
