@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import hashlib
+import ipaddress
 import os
+import re
 import shutil
 import socket
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,6 +21,10 @@ class TunnelResult:
     interface: str = ""
     message: str = ""
     process: subprocess.Popen[str] | None = None
+    gateway: str = ""
+    namespace: str = ""
+    inner_interface: str = ""
+    work_dir: str = ""
 
 def command_exists(name: str) -> bool:
     return shutil.which(name) is not None
@@ -214,28 +222,385 @@ class SSTPAdapter:
 class L2TPIPsecAdapter:
     protocol = "l2tp-ipsec"
 
+    def __init__(self) -> None:
+        self._active: dict[str, TunnelResult] = {}
+
     @staticmethod
     def available() -> bool:
-        # Connection activation is intentionally not enabled yet. L2TP/IPsec
-        # changes XFRM/IPsec state globally and will be moved into a dedicated
-        # network namespace before production use.
-        return (
-            command_exists("ipsec")
-            and command_exists("xl2tpd")
-            and command_exists("pppd")
+        required = ("ip", "iptables", "unshare", "ipsec", "xl2tpd", "pppd")
+        return all(command_exists(cmd) for cmd in required)
+
+    @staticmethod
+    def _validate_host(host: str) -> str:
+        host = str(host or "").strip()
+        if not host:
+            raise ValueError("empty L2TP server host")
+        try:
+            ipaddress.ip_address(host)
+            return host
+        except ValueError:
+            pass
+        if len(host) > 253 or not re.fullmatch(r"[A-Za-z0-9.-]+", host):
+            raise ValueError("invalid L2TP server hostname")
+        return host
+
+    @staticmethod
+    def _physical_interface() -> str:
+        try:
+            res = subprocess.run(
+                ["ip", "-o", "route", "show", "default"],
+                capture_output=True, text=True, timeout=3,
+            )
+            for line in res.stdout.splitlines():
+                parts = line.split()
+                if "dev" in parts:
+                    iface = parts[parts.index("dev") + 1]
+                    if iface and not iface.startswith(("tun", "tap", "ppp", "vpn_", "veth")):
+                        return iface
+        except Exception:
+            pass
+        return ""
+
+    @staticmethod
+    def _run(cmd: list[str], timeout: int = 8, check: bool = False) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=check)
+
+    @staticmethod
+    def _ns_exec(namespace: str, cmd: list[str], timeout: int = 8, check: bool = False) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["ip", "netns", "exec", namespace, *cmd],
+            capture_output=True, text=True, timeout=timeout, check=check,
         )
 
-    def connect(self, *args: Any, **kwargs: Any) -> TunnelResult:
-        return TunnelResult(
-            False,
-            self.protocol,
-            message="L2TP/IPsec adapter installed but activation is gated until network-namespace isolation is enabled",
+    @staticmethod
+    def _cleanup_iptables(subnet: str, physical: str) -> None:
+        if not subnet or not physical:
+            return
+        rules = [
+            ["iptables", "-t", "nat", "-D", "POSTROUTING", "-s", subnet, "-o", physical, "-j", "MASQUERADE"],
+            ["iptables", "-D", "FORWARD", "-s", subnet, "-o", physical, "-j", "ACCEPT"],
+            ["iptables", "-D", "FORWARD", "-d", subnet, "-i", physical, "-m", "state", "--state", "ESTABLISHED,RELATED", "-j", "ACCEPT"],
+        ]
+        for rule in rules:
+            try:
+                subprocess.run(rule, capture_output=True, timeout=3)
+            except Exception:
+                pass
+
+    @staticmethod
+    def _token(namespace: str) -> tuple[str, int]:
+        digest = hashlib.sha256(namespace.encode("utf-8")).digest()
+        slot = 16 + (digest[0] % 180)
+        token = hashlib.sha256(namespace.encode("utf-8")).hexdigest()[:6]
+        return token, slot
+
+    def connect(
+        self,
+        host: str,
+        username: str = "vpn",
+        password: str = "vpn",
+        psk: str = "vpn",
+        namespace: str = "aimili-l2tp",
+        timeout: int = 35,
+    ) -> TunnelResult:
+        if not self.available():
+            return TunnelResult(False, self.protocol, message="L2TP/IPsec dependencies are not installed")
+        try:
+            host = self._validate_host(host)
+        except Exception as exc:
+            return TunnelResult(False, self.protocol, message=str(exc))
+
+        namespace = re.sub(r"[^A-Za-z0-9_.-]+", "-", namespace)[:31] or "aimili-l2tp"
+        self.disconnect(namespace)
+
+        token, slot = self._token(namespace)
+        host_veth = f"alh{token}"[:15]
+        ns_veth = f"aln{token}"[:15]
+        subnet = f"10.254.{slot}.0/30"
+        host_ip = f"10.254.{slot}.1"
+        ns_ip = f"10.254.{slot}.2"
+        physical = self._physical_interface()
+        if not physical:
+            return TunnelResult(False, self.protocol, message="Unable to determine physical egress interface")
+
+        work_dir = Path(tempfile.mkdtemp(prefix=f"aimili-{namespace}-"))
+        run_dir = work_dir / "run"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        ipsec_conf = work_dir / "ipsec.conf"
+        ipsec_secrets = work_dir / "ipsec.secrets"
+        xl2tp_conf = work_dir / "xl2tpd.conf"
+        l2tp_secrets = work_dir / "l2tp-secrets"
+        ppp_options = work_dir / "ppp-options"
+        control_file = work_dir / "l2tp-control"
+        pid_file = work_dir / "xl2tpd.pid"
+        helper = work_dir / "run-l2tp.sh"
+
+        ipsec_conf.write_text(
+            f"""config setup
+    uniqueids=no
+
+conn vpngate
+    keyexchange=ikev1
+    authby=psk
+    type=transport
+    left=%defaultroute
+    leftprotoport=17/1701
+    right={host}
+    rightprotoport=17/1701
+    rightid=%any
+    forceencaps=yes
+    keyingtries=1
+    dpdaction=clear
+    dpddelay=20s
+    rekey=no
+    auto=add
+""",
+            encoding="utf-8",
         )
+        ipsec_secrets.write_text(f': PSK "{psk}"\n', encoding="utf-8")
+        try:
+            ipsec_secrets.chmod(0o600)
+        except OSError:
+            pass
+
+        ppp_options.write_text(
+            f"""name {username}
+password {password}
+noauth
+refuse-eap
+noccp
+noipdefault
+nodefaultroute
+ipcp-accept-local
+ipcp-accept-remote
+usepeerdns
+mtu 1360
+mru 1360
+persist 0
+maxfail 1
+""",
+            encoding="utf-8",
+        )
+        try:
+            ppp_options.chmod(0o600)
+        except OSError:
+            pass
+
+        xl2tp_conf.write_text(
+            f"""[global]
+port = 1701
+
+[lac vpngate]
+lns = {host}
+pppoptfile = {ppp_options}
+redial = no
+autodial = no
+length bit = yes
+""",
+            encoding="utf-8",
+        )
+        l2tp_secrets.write_text("", encoding="utf-8")
+
+        helper.write_text(
+            f"""#!/usr/bin/env bash
+set -euo pipefail
+mount --make-rprivate /
+mount --bind "{run_dir}" /run
+mount --bind "{ipsec_secrets}" /etc/ipsec.secrets
+
+cleanup() {{
+  set +e
+  if [ -S "{control_file}" ] || [ -e "{control_file}" ]; then
+    echo "d vpngate" > "{control_file}"
+  fi
+  ipsec down vpngate >/dev/null 2>&1 || true
+  kill "$XL2TP_PID" >/dev/null 2>&1 || true
+  kill "$STARTER_PID" >/dev/null 2>&1 || true
+  wait "$XL2TP_PID" >/dev/null 2>&1 || true
+  wait "$STARTER_PID" >/dev/null 2>&1 || true
+}}
+trap cleanup EXIT INT TERM
+
+ipsec start --nofork --conf "{ipsec_conf}" &
+STARTER_PID=$!
+sleep 2
+ipsec up vpngate
+xl2tpd -D -c "{xl2tp_conf}" -s "{l2tp_secrets}" -p "{pid_file}" -C "{control_file}" &
+XL2TP_PID=$!
+for _ in $(seq 1 20); do
+  [ -e "{control_file}" ] && break
+  sleep 0.25
+done
+echo "c vpngate" > "{control_file}"
+for _ in $(seq 1 60); do
+  IFACE=$(ip -o link show | awk -F': ' '$2 ~ /^ppp[0-9]+$/ {{print $2; exit}}')
+  if [ -n "$IFACE" ] && ip -4 -o addr show dev "$IFACE" | grep -q ' inet '; then
+    ip route replace default dev "$IFACE"
+    sysctl -w net.ipv4.ip_forward=1 >/dev/null
+    iptables -t nat -C POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null || \
+      iptables -t nat -A POSTROUTING -o "$IFACE" -j MASQUERADE
+    echo "$IFACE" > "{work_dir / 'ppp-iface'}"
+    touch "{work_dir / 'ready'}"
+    wait "$XL2TP_PID"
+    exit $?
+  fi
+  sleep 0.5
+done
+echo "PPP interface did not become ready" >&2
+exit 42
+""",
+            encoding="utf-8",
+        )
+        helper.chmod(0o700)
+
+        try:
+            self._run(["ip", "netns", "add", namespace], timeout=5, check=True)
+            self._run(["ip", "link", "add", host_veth, "type", "veth", "peer", "name", ns_veth], timeout=5, check=True)
+            self._run(["ip", "link", "set", ns_veth, "netns", namespace], timeout=5, check=True)
+            self._run(["ip", "addr", "add", f"{host_ip}/30", "dev", host_veth], timeout=5, check=True)
+            self._run(["ip", "link", "set", host_veth, "up"], timeout=5, check=True)
+
+            self._ns_exec(namespace, ["ip", "link", "set", "lo", "up"], timeout=5, check=True)
+            self._ns_exec(namespace, ["ip", "addr", "add", f"{ns_ip}/30", "dev", ns_veth], timeout=5, check=True)
+            self._ns_exec(namespace, ["ip", "link", "set", ns_veth, "up"], timeout=5, check=True)
+            self._ns_exec(namespace, ["ip", "route", "replace", "default", "via", host_ip, "dev", ns_veth], timeout=5, check=True)
+
+            try:
+                self._run(["sysctl", "-w", "net.ipv4.ip_forward=1"], timeout=3)
+            except Exception:
+                pass
+
+            nat_rules = [
+                ["iptables", "-t", "nat", "-A", "POSTROUTING", "-s", subnet, "-o", physical, "-j", "MASQUERADE"],
+                ["iptables", "-A", "FORWARD", "-s", subnet, "-o", physical, "-j", "ACCEPT"],
+                ["iptables", "-A", "FORWARD", "-d", subnet, "-i", physical, "-m", "state", "--state", "ESTABLISHED,RELATED", "-j", "ACCEPT"],
+            ]
+            for rule in nat_rules:
+                check_rule = rule.copy()
+                check_rule[2 if rule[1] != "-t" else 4] = "-C"
+                # Simpler idempotency: deletion was done in disconnect(), so add once.
+                self._run(rule, timeout=4, check=True)
+
+            proc = subprocess.Popen(
+                ["ip", "netns", "exec", namespace, "unshare", "--mount", "--propagation", "private", str(helper)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+
+            deadline = time.time() + timeout
+            ready = work_dir / "ready"
+            iface_file = work_dir / "ppp-iface"
+            while time.time() < deadline:
+                if proc.poll() is not None:
+                    output = ""
+                    try:
+                        output = (proc.stdout.read() if proc.stdout else "")[-2000:]
+                    except Exception:
+                        pass
+                    self.disconnect(namespace)
+                    return TunnelResult(False, self.protocol, message=output or "L2TP helper exited before PPP became ready")
+                if ready.exists() and iface_file.exists():
+                    inner_iface = iface_file.read_text(encoding="utf-8").strip()
+                    result = TunnelResult(
+                        True,
+                        self.protocol,
+                        interface=host_veth,
+                        gateway=ns_ip,
+                        namespace=namespace,
+                        inner_interface=inner_iface,
+                        work_dir=str(work_dir),
+                        message="L2TP/IPsec connected in isolated network namespace",
+                        process=proc,
+                    )
+                    self._active[namespace] = result
+                    return result
+                time.sleep(0.5)
+
+            self.disconnect(namespace)
+            return TunnelResult(False, self.protocol, message=f"L2TP/IPsec connection timed out after {timeout}s")
+        except Exception as exc:
+            self._cleanup_iptables(subnet, physical)
+            try:
+                subprocess.run(["ip", "netns", "del", namespace], capture_output=True, timeout=5)
+            except Exception:
+                pass
+            try:
+                shutil.rmtree(work_dir, ignore_errors=True)
+            except Exception:
+                pass
+            return TunnelResult(False, self.protocol, message=str(exc))
+
+    def disconnect(self, namespace: str = "aimili-l2tp") -> None:
+        namespace = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(namespace or "aimili-l2tp"))[:31]
+        result = self._active.pop(namespace, None)
+        token, slot = self._token(namespace)
+        physical = self._physical_interface()
+        subnet = f"10.254.{slot}.0/30"
+
+        if result and result.process and result.process.poll() is None:
+            result.process.terminate()
+            try:
+                result.process.wait(timeout=8)
+            except subprocess.TimeoutExpired:
+                result.process.kill()
+
+        try:
+            pids = self._run(["ip", "netns", "pids", namespace], timeout=3).stdout.split()
+            for pid in pids:
+                try:
+                    os.kill(int(pid), 15)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        try:
+            subprocess.run(["ip", "netns", "del", namespace], capture_output=True, timeout=6)
+        except Exception:
+            pass
+        self._cleanup_iptables(subnet, physical)
+
+        if result and result.work_dir:
+            try:
+                shutil.rmtree(result.work_dir, ignore_errors=True)
+            except Exception:
+                pass
+
+    @staticmethod
+    def egress_check(result: TunnelResult, timeout: int = 7) -> dict[str, Any]:
+        if not result.namespace or not result.inner_interface:
+            return {"ok": False, "error": "L2TP namespace/interface missing"}
+        cmd = [
+            "ip", "netns", "exec", result.namespace,
+            "curl", "-s",
+            "--interface", f"if!{result.inner_interface}",
+            "-w", "\\n%{time_total} %{http_code}",
+            "http://api.ipify.org",
+            "--max-time", "6",
+        ]
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            if res.returncode != 0:
+                return {"ok": False, "error": (res.stderr or f"curl exit {res.returncode}")[-500:]}
+            lines = res.stdout.strip().splitlines()
+            if len(lines) < 2:
+                return {"ok": False, "error": "L2TP egress check returned no data"}
+            timing = lines[-1].split()
+            if len(timing) != 2 or timing[1] != "200":
+                return {"ok": False, "error": f"L2TP egress HTTP error: {lines[-1]}"}
+            return {
+                "ok": True,
+                "ip": lines[0].strip(),
+                "latency_ms": int(float(timing[0]) * 1000),
+            }
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
 
 def capability_report() -> dict[str, Any]:
     return {
         "openvpn": {"installed": command_exists("openvpn"), "activation": "enabled"},
         "softether": {"installed": SoftEtherAdapter.available(), "activation": "development"},
         "sstp": {"installed": SSTPAdapter.available(), "activation": "development"},
-        "l2tp_ipsec": {"installed": L2TPIPsecAdapter.available(), "activation": "gated-netns"},
+        "l2tp_ipsec": {"installed": L2TPIPsecAdapter.available(), "activation": "development-netns"},
     }
