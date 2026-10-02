@@ -129,3 +129,25 @@ jobs:
           assert ("sstp", "tcp", 443) in protocols
           print(protocols)
           PY
+
+  ubuntu-runtime-prereqs:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install multi-protocol runtime dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends             iproute2 iptables curl ppp strongswan strongswan-starter xl2tpd sstp-client             softether-vpnclient softether-vpncmd
+      - name: Validate isolated namespace prerequisites
+        run: |
+          sudo python3 - <<'PY'
+          from tunnel_adapters import L2TPIPsecAdapter, capability_report
+          report = L2TPIPsecAdapter.environment_report(run_kernel_test=True)
+          print(report)
+          print(capability_report())
+          assert report["root"] is True
+          assert report["missing_commands"] == [], report
+          assert report["netns_supported"] is True
+          assert report["mount_namespace_supported"] is True
+          assert report["kernel_test_ok"] is True, report
+          PY
