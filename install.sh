@@ -65,7 +65,7 @@ if [ "$PKG_MGR" = "apt-get" ]; then
     apt-get install -y openvpn curl git ca-certificates iptables iproute2 psmisc python3 ppp
     if [ "$OS_TYPE" = "ubuntu" ]; then
         echo -e "  -> 安装 Ubuntu 多协议 VPN 依赖（SoftEther / L2TP-IPsec / SSTP）..."
-        apt-get install -y softether-vpnclient softether-vpncmd strongswan strongswan-starter xl2tpd sstp-client || \
+        apt-get install -y softether-vpnclient softether-vpncmd strongswan strongswan-starter xl2tpd sstp-client busybox || \
           echo -e "${YELLOW}  -> 部分多协议组件未安装成功；OpenVPN 主链路仍可继续，安装日志请检查软件源支持情况。${PLAIN}"
     fi
 elif [ "$PKG_MGR" = "apk" ]; then
