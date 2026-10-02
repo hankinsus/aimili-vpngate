@@ -44,6 +44,12 @@ def set_active_interface(iface: str) -> None:
     tmp.write_text(iface, encoding="utf-8")
     tmp.replace(ACTIVE_IFACE_FILE)
 
+def clear_active_interface() -> None:
+    try:
+        ACTIVE_IFACE_FILE.unlink(missing_ok=True)
+    except Exception:
+        pass
+
 def parse_int(value: Any) -> int:
     try:
         return int(value)
@@ -235,9 +241,9 @@ def create_connection(address: tuple[str, int], timeout: float = 20) -> socket.s
         except OSError as e:
             err = e
             if "operation not permitted" in str(e).lower() or e.errno == 1:
-                err = OSError(f"[错误代码 3006] [ERR_PROXY_BIND_TUN_PERM_DENIED] 绑定虚拟网卡 tun0 失败，权限不足！必须以 root 权限运行，或者进程缺少 CAP_NET_RAW 权限。")
+                err = OSError(f"[错误代码 3006] [ERR_PROXY_BIND_TUN_PERM_DENIED] 绑定当前 VPN 网卡失败，权限不足！必须以 root 权限运行，或者进程缺少 CAP_NET_RAW 权限。")
             elif "no such device" in str(e).lower() or e.errno == 19:
-                err = OSError(f"[错误代码 3004] [ERR_ROUTE_DEV_NOT_FOUND] 绑定虚拟网卡 tun0 失败，找不到当前活动 VPN 网卡！这通常是因为 VPN 隧道未成功建立或已异常退出。")
+                err = OSError(f"[错误代码 3004] [ERR_ROUTE_DEV_NOT_FOUND] 绑定当前 VPN 网卡失败，找不到当前活动 VPN 网卡！这通常是因为 VPN 隧道未成功建立或已异常退出。")
             if sock is not None:
                 sock.close()
     if err is not None:
