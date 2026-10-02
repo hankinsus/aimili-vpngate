@@ -376,6 +376,25 @@ def get_state() -> dict[str, Any]:
     state.pop("password", None)
     state["active_openvpn_node_id"] = active_openvpn_node_id
     state["active_pool_endpoint_id"] = active_pool_endpoint_id
+    state["active_pool_endpoint"] = None
+    if active_pool_endpoint_id:
+        try:
+            endpoint = node_pool.get_endpoint(active_pool_endpoint_id)
+            if endpoint:
+                state["active_pool_endpoint"] = {
+                    "endpoint_id": endpoint.get("endpoint_id", ""),
+                    "protocol": endpoint.get("protocol", ""),
+                    "transport": endpoint.get("transport", ""),
+                    "port": endpoint.get("port", 0),
+                    "hostname": endpoint.get("hostname", ""),
+                    "current_ip": endpoint.get("current_ip", ""),
+                    "country": endpoint.get("country", ""),
+                    "latency_ms": endpoint.get("latency_ewma", 0),
+                    "jitter_ms": endpoint.get("jitter_ewma", 0),
+                    "selection_score": endpoint.get("selection_score", 0),
+                }
+        except Exception:
+            pass
     state["active_tunnel_interface"] = proxy_server.get_active_interface()
     if active_external_tunnel is not None:
         state["active_tunnel_protocol"] = active_external_tunnel.protocol
@@ -4328,6 +4347,37 @@ function render(){
         </div>
       </div>
     `;
+  } else if (state.active_pool_endpoint) {
+    const ep = state.active_pool_endpoint;
+    const latencyValue = Number(state.proxy_latency_ms || ep.latency_ms || 0);
+    const latencyClass = getLatencyClass(latencyValue);
+    const latencyText = latencyValue ? `<span class="latency-val ${latencyClass}">${latencyValue} ms</span>` : "-";
+    const protocolName = String(ep.protocol || state.active_tunnel_protocol || "VPN").toUpperCase();
+    const endpointAddress = ep.hostname || ep.current_ip || ep.endpoint_id || "-";
+    activeCardContainer.innerHTML = `
+      <div class="active-card">
+        <div class="active-card-info">
+          <div class="stat-icon-wrapper" style="background: rgba(16, 185, 129, 0.15); border-color: rgba(16, 185, 129, 0.3); width: 48px; height: 48px; border-radius: 12px;">
+            <svg xmlns="http://www.w3.org/2000/svg" class="stat-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5" style="color: #34d399; width: 24px; height: 24px;"><path stroke-linecap="round" stroke-linejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>
+          </div>
+          <div class="active-card-details">
+            <div class="active-card-title">
+              <span class="badge available"><span class="badge-pulse"></span>已连接</span>
+              <strong>${esc(protocolName)} · ${esc(translateCountry(ep.country || "-"))}</strong>
+            </div>
+            <div class="active-card-value mono" style="font-size: 20px; margin-top: 2px;">
+              ${esc(endpointAddress)}${ep.port ? ":" + esc(String(ep.port)) : ""}
+            </div>
+            <div class="active-card-meta" style="margin-top: 4px;">
+              <span>活动网卡: <strong>${esc(state.active_tunnel_interface || "-")}</strong></span>
+              <span style="margin-left: 12px;">7928 出口延时: <strong>${latencyText}</strong></span>
+              <span style="margin-left: 12px;">Hot Pool: <strong>${esc(String(state.hot_pool_size || 0))}/${esc(String(state.hot_pool_target || 0))}</strong></span>
+            </div>
+          </div>
+        </div>
+        <button class="btn-danger" style="height: 38px; padding: 0 16px; border-radius: 8px;" onclick="disconnectNode()">断开连接</button>
+      </div>
+    `;
   } else if (activeNode) {
     const latencyClass = getLatencyClass(activeNode.latency_ms);
     const latencyText = activeNode.latency_ms ? `<span class="latency-val ${latencyClass}">${activeNode.latency_ms} ms</span>` : "-";
@@ -5940,23 +5990,26 @@ class Handler(BaseHTTPRequestHandler):
                 "details": f"监听地址: {LOCAL_PROXY_HOST}:{LOCAL_PROXY_PORT}",
                 "error": proxy_err
             }
-            ovpn_ok = active_openvpn_running()
-            ovpn_err = ""
-            ovpn_details = "未连接"
-            if ovpn_ok:
-                ovpn_details = f"已连接节点: {active_openvpn_node_id}"
-                if sys.platform.startswith("linux"):
-                    if not Path("/sys/class/net/tun0").exists():
-                        ovpn_err = "[警告] 虚拟网卡 (tun0) 未启用，可能存在策略路由配置问题。"
-            else:
-                if active_openvpn_node_id:
-                    ovpn_err = "连接已中断或 OpenVPN 核心程序异常退出。"
-                    ovpn_details = f"尝试连接节点 {active_openvpn_node_id} 失败"
-            openvpn_status = {
-                "name": "OpenVPN 核心连接",
-                "status": "running" if ovpn_ok else "stopped",
-                "details": ovpn_details,
-                "error": ovpn_err
+            tunnel_ok = active_tunnel_running()
+            tunnel_state = get_state()
+            tunnel_protocol = str(tunnel_state.get("active_tunnel_protocol") or "")
+            tunnel_iface = str(tunnel_state.get("active_tunnel_interface") or "")
+            tunnel_id = active_pool_endpoint_id or active_openvpn_node_id
+            tunnel_err = ""
+            tunnel_details = "未连接"
+            if tunnel_ok:
+                tunnel_details = f"协议: {tunnel_protocol or 'unknown'}; 接口: {tunnel_iface or '-'}; 端点: {tunnel_id or '-'}"
+                if sys.platform.startswith("linux") and tunnel_iface:
+                    if not (Path("/sys/class/net") / tunnel_iface).exists():
+                        tunnel_err = f"[警告] 活动 VPN 网卡 ({tunnel_iface}) 不存在，可能存在隧道或策略路由问题。"
+            elif tunnel_id:
+                tunnel_err = "活动 VPN 隧道已中断或核心进程异常退出。"
+                tunnel_details = f"最近活动端点: {tunnel_id}"
+            tunnel_status = {
+                "name": "活动 VPN 隧道",
+                "status": "running" if tunnel_ok else "stopped",
+                "details": tunnel_details,
+                "error": tunnel_err
             }
             now = time.time()
             server_uptime = now - server_start_time
@@ -5986,7 +6039,7 @@ class Handler(BaseHTTPRequestHandler):
                 "services": [
                     web_ui_status,
                     proxy_gateway_status,
-                    openvpn_status,
+                    tunnel_status,
                     collector_status,
                     checker_status,
                     pinger_status
