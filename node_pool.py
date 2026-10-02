@@ -332,7 +332,7 @@ class NodePool:
                     UPDATE endpoints SET status=?, last_success=?, success_count=?, success_streak=?,
                     fail_streak=0, next_test=?, latency_ewma=?, jitter_ewma=? WHERE endpoint_id=?
                     """,
-                    (status, now, success_count, success_streak, now + 60, latency_ewma, jitter_ewma, eid),
+                    (status, now, success_count, success_streak, now + 900, latency_ewma, jitter_ewma, eid),
                 )
                 db.execute("UPDATE servers SET state=?, last_seen=? WHERE server_key=?", (status, now, key))
             else:
@@ -408,7 +408,7 @@ class NodePool:
                     UPDATE endpoints SET status=?, last_success=?, success_count=?, success_streak=?,
                     fail_streak=0, next_test=?, latency_ewma=?, jitter_ewma=? WHERE endpoint_id=?
                     """,
-                    (status, now, success_count, success_streak, now + 60, latency_ewma, jitter_ewma, endpoint_id),
+                    (status, now, success_count, success_streak, now + 900, latency_ewma, jitter_ewma, endpoint_id),
                 )
                 db.execute("UPDATE servers SET state=?, last_seen=? WHERE server_key=?", (status, now, row["server_key"]))
             else:
