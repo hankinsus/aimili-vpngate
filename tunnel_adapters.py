@@ -65,23 +65,89 @@ def interface_has_ipv4(iface: str) -> bool:
     except Exception:
         return False
 
-def obtain_dhcp(iface: str, timeout: int = 12) -> bool:
+def obtain_dhcp_lease(iface: str, timeout: int = 15) -> tuple[bool, str]:
+    """Acquire a DHCP lease without installing a system default route.
+
+    The DHCP hook configures only the interface address/link and records the
+    offered gateway. Policy routing is added later by the tunnel manager.
+    """
     if not iface:
-        return False
-    clients = [
-        ["dhclient", "-1", "-v", iface],
-        ["udhcpc", "-n", "-q", "-i", iface],
-    ]
-    for cmd in clients:
-        if not command_exists(cmd[0]):
-            continue
-        try:
-            res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-            if res.returncode == 0 and interface_has_ipv4(iface):
-                return True
-        except Exception:
-            pass
-    return interface_has_ipv4(iface)
+        return False, ""
+
+    work_dir = Path(tempfile.mkdtemp(prefix="aimili-dhcp-"))
+    lease_file = work_dir / "lease.json"
+    hook = work_dir / "dhcp-hook.py"
+    hook.write_text(
+        """#!/usr/bin/env python3
+import ipaddress
+import json
+import os
+import pathlib
+import subprocess
+import sys
+
+event = (sys.argv[1] if len(sys.argv) > 1 else os.environ.get("reason", "")).lower()
+iface = os.environ.get("interface", "")
+if not iface:
+    sys.exit(0)
+
+if event in ("deconfig", "expire", "fail", "release", "stop"):
+    subprocess.run(["ip", "addr", "flush", "dev", iface], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    sys.exit(0)
+
+if event not in ("bound", "renew", "rebind", "reboot"):
+    sys.exit(0)
+
+ip = os.environ.get("ip") or os.environ.get("new_ip_address") or ""
+mask = os.environ.get("subnet") or os.environ.get("new_subnet_mask") or "255.255.255.0"
+routers = os.environ.get("router") or os.environ.get("new_routers") or ""
+gateway = routers.split()[0] if routers.split() else ""
+if not ip:
+    sys.exit(1)
+
+prefix = ipaddress.IPv4Network("0.0.0.0/" + mask).prefixlen
+subprocess.run(["ip", "addr", "flush", "dev", iface], check=True)
+subprocess.run(["ip", "addr", "add", f"{ip}/{prefix}", "dev", iface], check=True)
+subprocess.run(["ip", "link", "set", iface, "up"], check=True)
+pathlib.Path("/PLACEHOLDER").write_text(
+    json.dumps({"ip": ip, "prefix": prefix, "gateway": gateway}),
+    encoding="utf-8",
+)
+""".replace("/PLACEHOLDER", str(lease_file)),
+        encoding="utf-8",
+    )
+    hook.chmod(0o700)
+
+    commands: list[list[str]] = []
+    if command_exists("busybox"):
+        commands.append([
+            "busybox", "udhcpc", "-i", iface, "-n", "-q",
+            "-t", "4", "-T", "3", "-s", str(hook),
+        ])
+    elif command_exists("udhcpc"):
+        commands.append([
+            "udhcpc", "-i", iface, "-n", "-q",
+            "-t", "4", "-T", "3", "-s", str(hook),
+        ])
+    if command_exists("dhclient"):
+        commands.append(["dhclient", "-1", "-v", "-sf", str(hook), iface])
+
+    try:
+        for cmd in commands:
+            try:
+                subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            except Exception:
+                continue
+            if lease_file.exists() and interface_has_ipv4(iface):
+                try:
+                    import json
+                    lease = json.loads(lease_file.read_text(encoding="utf-8"))
+                    return True, str(lease.get("gateway") or "")
+                except Exception:
+                    return True, ""
+        return interface_has_ipv4(iface), ""
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
 
 class SoftEtherAdapter:
     protocol = "softether"
@@ -131,13 +197,18 @@ class SoftEtherAdapter:
                 subprocess.run(["ip", "addr", "flush", "dev", iface], capture_output=True, timeout=3)
             except Exception:
                 pass
-            if not obtain_dhcp(iface):
+            dhcp_ok, gateway = obtain_dhcp_lease(iface)
+            if not dhcp_ok:
                 self.disconnect(account)
                 return TunnelResult(False, self.protocol, interface=iface, message="SoftEther connected but DHCP/IP assignment failed")
+            if not gateway:
+                self.disconnect(account)
+                return TunnelResult(False, self.protocol, interface=iface, message="SoftEther DHCP lease did not provide a gateway")
             return TunnelResult(
                 True,
                 self.protocol,
                 interface=iface,
+                gateway=gateway,
                 message="SoftEther connected",
                 details={"account": account, "nic": nic},
             )
