@@ -25,6 +25,7 @@ class TunnelResult:
     namespace: str = ""
     inner_interface: str = ""
     work_dir: str = ""
+    details: dict[str, Any] | None = None
 
 def command_exists(name: str) -> bool:
     return shutil.which(name) is not None
@@ -133,7 +134,13 @@ class SoftEtherAdapter:
             if not obtain_dhcp(iface):
                 self.disconnect(account)
                 return TunnelResult(False, self.protocol, interface=iface, message="SoftEther connected but DHCP/IP assignment failed")
-            return TunnelResult(True, self.protocol, interface=iface, message="SoftEther connected")
+            return TunnelResult(
+                True,
+                self.protocol,
+                interface=iface,
+                message="SoftEther connected",
+                details={"account": account, "nic": nic},
+            )
         except Exception as exc:
             return TunnelResult(False, self.protocol, message=str(exc))
 
@@ -516,6 +523,7 @@ exit 42
                         work_dir=str(work_dir),
                         message="L2TP/IPsec connected in isolated network namespace",
                         process=proc,
+                        details={"subnet": subnet, "physical": physical},
                     )
                     self._active[namespace] = result
                     return result
