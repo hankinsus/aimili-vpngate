@@ -671,7 +671,7 @@ def diagnose_local_obstructions(proxy_port: int = 7928, host: str = "127.0.0.1")
         try:
             res = subprocess.run(["systemctl", "is-active", "firewalld"], capture_output=True, text=True, timeout=2)
             if res.returncode == 0 and res.stdout.strip() == "active":
-                return 3007, "[ERR_FIREWALL_BLOCKING_FORWARD] 本机 Firewalld 防火墙正在运行。请确保您已将代理端口及 VPN 网卡(tun0)加入信任区域以避免流量被拦截。"
+                return 3007, "[ERR_FIREWALL_BLOCKING_FORWARD] 本机 Firewalld 防火墙正在运行。请确保您已将代理端口及 当前活动 VPN 网卡加入信任区域以避免流量被拦截。"
         except Exception:
             pass
 
@@ -701,7 +701,7 @@ def diagnose_local_obstructions(proxy_port: int = 7928, host: str = "127.0.0.1")
             try:
                 val = rp_all_path.read_text(encoding="utf-8").strip()
                 if val == "1":
-                    return 3008, "[ERR_ROUTE_RP_FILTER_STRICT] 系统启用了严格的反向路径过滤(rp_filter=1)。原因: 在启用策略路由时，严格的路径过滤会导致通过虚拟网卡 tun0 的回包被内核静默丢弃，导致连接超时。请将 net.ipv4.conf.all.rp_filter 设置为 2 或 0。"
+                    return 3008, "[ERR_ROUTE_RP_FILTER_STRICT] 系统启用了严格的反向路径过滤(rp_filter=1)。原因: 在启用策略路由时，严格的路径过滤会导致通过当前活动 VPN 网卡的回包被内核静默丢弃，导致连接超时。请将 net.ipv4.conf.all.rp_filter 设置为 2 或 0。"
             except Exception:
                 pass
 
