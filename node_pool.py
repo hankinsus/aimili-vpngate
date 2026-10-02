@@ -360,6 +360,115 @@ class NodePool:
                 db.execute("UPDATE servers SET state=? WHERE server_key=?", (status, key))
             db.commit()
 
+    def get_endpoint(self, endpoint_id: str) -> dict[str, Any] | None:
+        with self.lock, closing(self._connect()) as db:
+            row = db.execute(
+                """
+                SELECT e.*, s.hostname, s.current_ip, s.country, s.state AS server_state,
+                       s.metadata_json AS server_metadata_json
+                FROM endpoints e
+                JOIN servers s ON s.server_key=e.server_key
+                WHERE e.endpoint_id=?
+                """,
+                (str(endpoint_id),),
+            ).fetchone()
+            if row is None:
+                return None
+            item = dict(row)
+            try:
+                item["metadata"] = json.loads(item.pop("metadata_json") or "{}")
+            except Exception:
+                item["metadata"] = {}
+                item.pop("metadata_json", None)
+            try:
+                item["server_metadata"] = json.loads(item.pop("server_metadata_json") or "{}")
+            except Exception:
+                item["server_metadata"] = {}
+                item.pop("server_metadata_json", None)
+            return item
+
+    def record_endpoint_probe(self, endpoint_id: str, ok: bool, latency_ms: int = 0, message: str = "") -> None:
+        now = time.time()
+        with self.lock, closing(self._connect()) as db:
+            row = db.execute("SELECT * FROM endpoints WHERE endpoint_id=?", (str(endpoint_id),)).fetchone()
+            if row is None:
+                return
+            old_latency = float(row["latency_ewma"] or 0)
+            old_jitter = float(row["jitter_ewma"] or 0)
+            if ok:
+                latency = max(0, int(latency_ms or 0))
+                latency_ewma = float(latency) if old_latency <= 0 else old_latency * 0.75 + latency * 0.25
+                jitter_sample = abs(float(latency) - old_latency) if old_latency > 0 and latency > 0 else 0.0
+                jitter_ewma = jitter_sample if old_jitter <= 0 else old_jitter * 0.75 + jitter_sample * 0.25
+                success_count = int(row["success_count"]) + 1
+                success_streak = int(row["success_streak"]) + 1
+                status = "HOT" if success_streak >= 3 and jitter_ewma <= 80 else "AVAILABLE"
+                db.execute(
+                    """
+                    UPDATE endpoints SET status=?, last_success=?, success_count=?, success_streak=?,
+                    fail_streak=0, next_test=?, latency_ewma=?, jitter_ewma=? WHERE endpoint_id=?
+                    """,
+                    (status, now, success_count, success_streak, now + 60, latency_ewma, jitter_ewma, endpoint_id),
+                )
+                db.execute("UPDATE servers SET state=?, last_seen=? WHERE server_key=?", (status, now, row["server_key"]))
+            else:
+                failure_count = int(row["failure_count"]) + 1
+                fail_streak = int(row["fail_streak"]) + 1
+                backoff = min(7200, 30 * (4 ** min(fail_streak - 1, 4)))
+                status = "DEGRADED" if fail_streak < 3 else "COOLDOWN"
+                try:
+                    meta = json.loads(row["metadata_json"] or "{}")
+                    if not isinstance(meta, dict):
+                        meta = {}
+                except Exception:
+                    meta = {}
+                meta["last_error"] = message
+                db.execute(
+                    """
+                    UPDATE endpoints SET status=?, last_failure=?, failure_count=?, fail_streak=?,
+                    success_streak=0, next_test=?, metadata_json=? WHERE endpoint_id=?
+                    """,
+                    (
+                        status, now, failure_count, fail_streak, now + backoff,
+                        json.dumps(meta, ensure_ascii=False), endpoint_id,
+                    ),
+                )
+                db.execute("UPDATE servers SET state=? WHERE server_key=?", (status, row["server_key"]))
+            db.commit()
+
+    def due_endpoints(self, protocols: tuple[str, ...] = ("softether", "sstp"), limit: int = 20) -> list[dict[str, Any]]:
+        now = time.time()
+        wanted = tuple(str(p).lower() for p in protocols if p)
+        if not wanted:
+            return []
+        placeholders = ",".join("?" for _ in wanted)
+        params: list[Any] = [*wanted, now, max(1, min(int(limit), 200))]
+        with self.lock, closing(self._connect()) as db:
+            rows = db.execute(
+                f"""
+                SELECT e.endpoint_id
+                FROM endpoints e
+                JOIN servers s ON s.server_key=e.server_key
+                WHERE e.protocol IN ({placeholders})
+                  AND e.next_test <= ?
+                  AND e.status NOT IN ('RETIRED')
+                ORDER BY
+                  CASE e.status
+                    WHEN 'HOT' THEN 0
+                    WHEN 'AVAILABLE' THEN 1
+                    WHEN 'NEW' THEN 2
+                    WHEN 'DEGRADED' THEN 3
+                    WHEN 'COOLDOWN' THEN 4
+                    ELSE 5
+                  END,
+                  e.last_success DESC,
+                  e.last_seen DESC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        return [self.get_endpoint(row["endpoint_id"]) for row in rows if row["endpoint_id"]]
+
     def stats(self) -> dict[str, Any]:
         with self.lock, closing(self._connect()) as db:
             servers = db.execute("SELECT COUNT(*) c FROM servers").fetchone()["c"]
