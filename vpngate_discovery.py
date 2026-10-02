@@ -9,6 +9,7 @@ from html.parser import HTMLParser
 from typing import Any
 
 VPNGATE_HTML_URL = "https://www.vpngate.net/en/"
+VPNGATE_MIRROR_LIST_URL = "https://www.vpngate.net/en/sites.aspx"
 
 class _TableParser(HTMLParser):
     def __init__(self) -> None:
@@ -194,3 +195,83 @@ def fetch_server_table(url: str = VPNGATE_HTML_URL, timeout: int = 15) -> list[d
     with urllib.request.urlopen(req, timeout=timeout) as response:
         raw = response.read().decode("utf-8", errors="replace")
     return parse_server_table(raw)
+
+
+def fetch_mirror_urls(url: str = VPNGATE_MIRROR_LIST_URL, timeout: int = 10) -> list[str]:
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "Mozilla/5.0 AimiliVPN/3.0", "Accept": "text/html"},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        raw = response.read().decode("utf-8", errors="replace")
+    urls = []
+    seen = set()
+    for match in re.finditer(r"https?://[^\s\"'<>]+/en/", raw, re.I):
+        mirror = html.unescape(match.group(0)).strip()
+        if mirror.lower().startswith("https://www.vpngate.net/"):
+            continue
+        if mirror not in seen:
+            seen.add(mirror)
+            urls.append(mirror)
+    return urls
+
+def merge_servers(snapshots: list[list[dict[str, Any]]]) -> list[dict[str, Any]]:
+    merged: dict[str, dict[str, Any]] = {}
+    for snapshot in snapshots:
+        for server in snapshot:
+            key = str(server.get("hostname") or server.get("ip") or "").strip().lower()
+            if not key:
+                continue
+            existing = merged.get(key)
+            if existing is None:
+                cloned = dict(server)
+                cloned["protocols"] = [dict(p) for p in (server.get("protocols") or [])]
+                merged[key] = cloned
+                continue
+
+            # Keep fresher non-empty scalar values and union protocol endpoints.
+            for field in ("hostname", "ip", "country", "sessions", "speed", "ping", "score"):
+                value = server.get(field)
+                if value not in (None, "", 0):
+                    existing[field] = value
+
+            protocol_keys = {
+                (
+                    str(p.get("protocol") or ""),
+                    str(p.get("transport") or ""),
+                    int(p.get("port") or 0),
+                    str(p.get("hostname") or ""),
+                )
+                for p in existing.get("protocols") or []
+            }
+            for endpoint in server.get("protocols") or []:
+                pkey = (
+                    str(endpoint.get("protocol") or ""),
+                    str(endpoint.get("transport") or ""),
+                    int(endpoint.get("port") or 0),
+                    str(endpoint.get("hostname") or ""),
+                )
+                if pkey not in protocol_keys:
+                    existing.setdefault("protocols", []).append(dict(endpoint))
+                    protocol_keys.add(pkey)
+    return list(merged.values())
+
+def fetch_multi_source_tables(max_mirrors: int = 2) -> tuple[list[dict[str, Any]], list[str]]:
+    sources = [VPNGATE_HTML_URL]
+    try:
+        mirrors = fetch_mirror_urls()
+        sources.extend(mirrors[: max(0, int(max_mirrors))])
+    except Exception:
+        pass
+
+    snapshots: list[list[dict[str, Any]]] = []
+    successful_sources: list[str] = []
+    for source in sources:
+        try:
+            servers = fetch_server_table(source, timeout=12)
+            if servers:
+                snapshots.append(servers)
+                successful_sources.append(source)
+        except Exception:
+            continue
+    return merge_servers(snapshots), successful_sources
