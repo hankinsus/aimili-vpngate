@@ -199,7 +199,14 @@ class SoftEtherAdapter:
             # Idempotent cleanup. These commands may fail when entries do not exist.
             self._vpncmd("AccountDisconnect", account, timeout=5)
             self._vpncmd("AccountDelete", account, timeout=5)
-            self._vpncmd("NicCreate", nic, timeout=8)
+            self._vpncmd("NicDelete", nic, timeout=5)
+            nic_created = self._vpncmd("NicCreate", nic, timeout=8)
+            if nic_created.returncode != 0:
+                return TunnelResult(False, self.protocol, message=(nic_created.stdout + nic_created.stderr)[-1200:])
+            nic_enabled = self._vpncmd("NicEnable", nic, timeout=8)
+            if nic_enabled.returncode != 0:
+                self.disconnect(account, nic=nic, delete=True)
+                return TunnelResult(False, self.protocol, message=(nic_enabled.stdout + nic_enabled.stderr)[-1200:])
 
             created = self._vpncmd(
                 "AccountCreate", account,
