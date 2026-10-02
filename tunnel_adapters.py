@@ -721,9 +721,26 @@ exit 42
                     return result
                 time.sleep(0.5)
 
+            timeout_output = ""
+            try:
+                if proc.poll() is None:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait(timeout=3)
+                if proc.stdout:
+                    timeout_output = (proc.stdout.read() or "")[-3000:]
+            except Exception as exc:
+                timeout_output = f"log_capture_error={exc}"
             self.disconnect(namespace)
             shutil.rmtree(work_dir, ignore_errors=True)
-            return TunnelResult(False, self.protocol, message=f"L2TP/IPsec connection timed out after {timeout}s")
+            return TunnelResult(
+                False,
+                self.protocol,
+                message=f"L2TP/IPsec connection timed out after {timeout}s. {timeout_output}",
+            )
         except Exception as exc:
             self._cleanup_iptables(subnet, physical)
             try:
