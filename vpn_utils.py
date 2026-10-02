@@ -429,19 +429,23 @@ def enrich_ip_info(nodes: list[dict[str, Any]]) -> None:
                     if not query_ip:
                         continue
 
+                    # Network type and VPN/proxy reputation are different dimensions.
+                    # VPNGate exits are expected to be detected as proxies, including many
+                    # volunteer nodes running on residential ISP connections. Treating
+                    # proxy=true as hosting incorrectly hides residential nodes.
                     ip_type = "residential"
                     if item.get("mobile"):
                         ip_type = "mobile"
-                    elif item.get("hosting") or item.get("proxy"):
+                    elif item.get("hosting"):
                         ip_type = "hosting"
 
                     quality = "normal"
-                    if item.get("proxy"):
-                        quality = "proxy"
-                    elif item.get("hosting"):
+                    if item.get("hosting"):
                         quality = "datacenter"
                     elif item.get("mobile"):
                         quality = "mobile"
+                    elif item.get("proxy"):
+                        quality = "proxy"
 
                     loc = " ".join(part for part in [item.get("country"), item.get("regionName"), item.get("city")] if part)
 
