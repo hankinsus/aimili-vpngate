@@ -495,6 +495,21 @@ class L2TPIPsecAdapter:
         except Exception as exc:
             return TunnelResult(False, self.protocol, message=str(exc))
 
+        # Resolve before entering the network namespace. Ubuntu often uses a
+        # loopback DNS stub (127.0.0.53) that is not reachable inside a fresh
+        # netns. VPNGate L2TP/IPsec accepts the server IPv4 address directly.
+        resolved_host = host
+        try:
+            ipaddress.ip_address(host)
+        except ValueError:
+            try:
+                infos = socket.getaddrinfo(host, 1701, socket.AF_INET, socket.SOCK_DGRAM)
+                if not infos:
+                    raise OSError("no IPv4 address returned")
+                resolved_host = str(infos[0][4][0])
+            except Exception as exc:
+                return TunnelResult(False, self.protocol, message=f"Unable to resolve L2TP server {host}: {exc}")
+
         namespace = re.sub(r"[^A-Za-z0-9_.-]+", "-", namespace)[:31] or "aimili-l2tp"
         self.disconnect(namespace)
 
@@ -530,7 +545,7 @@ conn vpngate
     type=transport
     left=%defaultroute
     leftprotoport=17/1701
-    right={host}
+    right={resolved_host}
     rightprotoport=17/1701
     rightid=%any
     forceencaps=yes
@@ -576,7 +591,7 @@ maxfail 1
 port = 1701
 
 [lac vpngate]
-lns = {host}
+lns = {resolved_host}
 pppoptfile = {ppp_options}
 redial = no
 autodial = no
