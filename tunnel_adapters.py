@@ -182,6 +182,27 @@ class SoftEtherAdapter:
         cmd = ["vpncmd", "localhost", "/CLIENT", "/CMD", *args]
         return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
 
+    def _wait_account_connected(self, account: str, timeout: float = 15.0) -> tuple[bool, str]:
+        deadline = time.time() + timeout
+        last_output = ""
+        while time.time() < deadline:
+            try:
+                status = self._vpncmd("AccountStatusGet", account, timeout=5)
+                last_output = (status.stdout or "") + (status.stderr or "")
+                normalized = " ".join(last_output.lower().split())
+                connected_markers = (
+                    "connection completed",
+                    "session established",
+                    "connection status | connected",
+                    "connection status|connected",
+                )
+                if any(marker in normalized for marker in connected_markers):
+                    return True, last_output
+            except Exception as exc:
+                last_output = str(exc)
+            time.sleep(1)
+        return False, last_output
+
     def connect(self, host: str, port: int = 443, account: str = "aimili", nic: str = "aimili", username: str = "vpn", password: str = "vpn") -> TunnelResult:
         if not self.available():
             return TunnelResult(False, self.protocol, message="vpnclient/vpncmd not installed")
@@ -225,6 +246,15 @@ class SoftEtherAdapter:
             connected = self._vpncmd("AccountConnect", account, timeout=10)
             if connected.returncode != 0:
                 return TunnelResult(False, self.protocol, message=(connected.stdout + connected.stderr)[-1200:])
+
+            session_ok, session_status = self._wait_account_connected(account, timeout=15)
+            if not session_ok:
+                self.disconnect(account, nic=nic, delete=True)
+                return TunnelResult(
+                    False,
+                    self.protocol,
+                    message=f"SoftEther session did not reach connected state: {session_status[-1800:]}",
+                )
 
             iface = wait_for_new_interface(before, ("vpn_",), timeout=12)
             if not iface:
