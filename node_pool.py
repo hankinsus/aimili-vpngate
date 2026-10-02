@@ -109,6 +109,9 @@ class NodePool:
                     "speed": int(server.get("speed") or 0),
                     "sessions": int(server.get("sessions") or 0),
                     "score": int(server.get("score") or 0),
+                    "source_count": int(server.get("source_count") or 0),
+                    "trusted_observation": bool(server.get("trusted_observation")),
+                    "sources": list(server.get("_sources") or []),
                 }
                 existing_server = db.execute(
                     "SELECT metadata_json FROM servers WHERE server_key=?",
@@ -153,6 +156,8 @@ class NodePool:
                         "hostname": str(endpoint.get("hostname") or hostname or "").strip().lower(),
                         "ip": ip,
                         "source": source,
+                        "source_count": int(server.get("source_count") or 0),
+                        "trusted_observation": bool(server.get("trusted_observation")),
                     }
                     existing_endpoint = db.execute(
                         "SELECT metadata_json FROM endpoints WHERE endpoint_id=?",
@@ -302,6 +307,8 @@ class NodePool:
                 endpoint_meta = {
                     "node_id": node.get("id", ""),
                     "config_file": node.get("config_file", ""),
+                    "trusted_observation": True,
+                    "source_count": 1,
                 }
                 existing_endpoint = db.execute(
                     "SELECT metadata_json FROM endpoints WHERE endpoint_id=?",
@@ -678,7 +685,18 @@ class NodePool:
                 """,
                 params,
             ).fetchall()
-        return [self.get_endpoint(row["endpoint_id"]) for row in rows if row["endpoint_id"]]
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            endpoint = self.get_endpoint(row["endpoint_id"])
+            if not endpoint:
+                continue
+            metadata = endpoint.get("metadata") or {}
+            if endpoint.get("protocol") != "openvpn" and not metadata.get("trusted_observation"):
+                continue
+            result.append(endpoint)
+            if len(result) >= max(1, min(int(limit), 200)):
+                break
+        return result
 
     def stats(self) -> dict[str, Any]:
         with self.lock, closing(self._connect()) as db:
