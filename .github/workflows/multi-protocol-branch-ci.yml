@@ -180,3 +180,35 @@ jobs:
           assert report["mount_namespace_supported"] is True
           assert report["kernel_test_ok"] is True, report
           PY
+      - name: Validate private-run strongSwan starter
+        run: |
+          set -e
+          TMPDIR="$(mktemp -d)"
+          cat > "$TMPDIR/ipsec.conf" <<'EOF'
+          config setup
+              uniqueids=no
+
+          conn dummy
+              keyexchange=ikev1
+              authby=psk
+              type=transport
+              left=127.0.0.1
+              right=192.0.2.1
+              auto=add
+          EOF
+          mkdir -p "$TMPDIR/run"
+          sudo ip netns add aimili-ci-ipsec
+          sudo ip netns exec aimili-ci-ipsec ip link set lo up
+          sudo ip netns exec aimili-ci-ipsec env RUN_DIR="$TMPDIR/run" CONF="$TMPDIR/ipsec.conf"             unshare --mount --propagation private bash -c '
+              set -e
+              mount --make-rprivate /
+              mount --bind "$RUN_DIR" /run
+              ipsec start --nofork --conf "$CONF" &
+              PID=$!
+              sleep 3
+              kill -0 "$PID"
+              kill "$PID"
+              wait "$PID" || true
+            '
+          sudo ip netns del aimili-ci-ipsec
+          rm -rf "$TMPDIR"
