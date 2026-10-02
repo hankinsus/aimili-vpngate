@@ -360,10 +360,18 @@ def read_nodes() -> list[dict[str, Any]]:
     return [item for item in raw if isinstance(item, dict)]
 
 def get_state() -> dict[str, Any]:
-    global active_openvpn_node_id, is_connecting
+    global active_openvpn_node_id, active_pool_endpoint_id, is_connecting
     state = read_json(STATE_FILE, {})
     state.pop("password", None)
     state["active_openvpn_node_id"] = active_openvpn_node_id
+    state["active_pool_endpoint_id"] = active_pool_endpoint_id
+    state["active_tunnel_interface"] = proxy_server.get_active_interface()
+    if active_external_tunnel is not None:
+        state["active_tunnel_protocol"] = active_external_tunnel.protocol
+    elif active_openvpn_running():
+        state["active_tunnel_protocol"] = "openvpn"
+    else:
+        state.setdefault("active_tunnel_protocol", "")
     state["is_connecting"] = is_connecting
     state["maintenance_running"] = maintenance_lock.locked()
     state.setdefault("api_url", API_URL)
@@ -398,10 +406,21 @@ def safe_name(value: str) -> str:
     return value.strip("._") or "node"
 
 def clear_active_connection_state(message: str) -> None:
-    global active_openvpn_process, active_openvpn_node_id
+    global active_openvpn_process, active_openvpn_node_id, active_external_tunnel, active_pool_endpoint_id
     stop_process(active_openvpn_process)
     active_openvpn_process = None
     active_openvpn_node_id = ""
+    if active_external_tunnel is not None:
+        try:
+            if active_external_tunnel.protocol == "softether":
+                tunnel_adapters.SoftEtherAdapter().disconnect()
+            elif active_external_tunnel.protocol == "sstp":
+                tunnel_adapters.SSTPAdapter.disconnect(active_external_tunnel.process)
+        except Exception:
+            pass
+    active_external_tunnel = None
+    active_pool_endpoint_id = ""
+    cleanup_policy_routing()
     with lock:
         nodes = read_nodes()
         for item in nodes:
@@ -409,6 +428,9 @@ def clear_active_connection_state(message: str) -> None:
         write_json(NODES_FILE, nodes)
     set_state(
         active_openvpn_node_id="",
+        active_pool_endpoint_id="",
+        active_tunnel_protocol="",
+        active_tunnel_interface="",
         is_connecting=False,
         active_node_latency="无活动连接",
         last_check_message=message,
@@ -1916,7 +1938,7 @@ def maintain_valid_nodes(force: bool = False) -> str:
                     with lock:
                         if active_openvpn_node_id:
                             has_active_id = True
-                            stop_active_openvpn()
+                            stop_all_tunnels()
                     if has_active_id:
                         print("[维护线程] 检测到当前 OpenVPN 进程已意外退出，准备自动切换节点", flush=True)
                         is_connecting = False
@@ -2003,7 +2025,7 @@ def maintain_valid_nodes(force: bool = False) -> str:
         should_fast_connect = (
             ui_cfg.get("connection_enabled", True)
             and ui_cfg.get("routing_mode", "auto") != "fixed_ip"
-            and not active_openvpn_running()
+            and not active_tunnel_running()
         )
         if should_fast_connect:
             with lock:
@@ -5401,6 +5423,14 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": True, "pool": node_pool.stats()})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+        elif effective_path == "/api/pool_endpoints":
+            try:
+                query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+                protocol = str((query.get("protocol") or [""])[0]).strip().lower() or None
+                limit = bounded_int((query.get("limit") or ["100"])[0], 100, 1, 500)
+                self.send_json({"ok": True, "endpoints": node_pool.list_endpoints(protocol=protocol, limit=limit)})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         elif effective_path == "/api/link_probe":
             # This endpoint is intentionally authenticated. The remote client can
             # measure RTT from request/response timing; server data reports the
@@ -5890,6 +5920,26 @@ class Handler(BaseHTTPRequestHandler):
                 last_active_latency = 0
                 set_state(active_openvpn_node_id="", last_check_message="手动断开连接", active_node_latency="无活动连接")
                 self.send_json({"ok": True})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+        elif effective_path == "/api/refresh_protocol_catalog":
+            try:
+                self.read_request_body()
+                result = refresh_multi_protocol_catalog(force=True)
+                self.send_json(result, HTTPStatus.OK if result.get("ok") else HTTPStatus.BAD_GATEWAY)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+        elif effective_path == "/api/connect_pool_endpoint":
+            try:
+                payload = self.read_json_body()
+                endpoint_id = str(payload.get("endpoint_id") or "").strip()
+                if not endpoint_id:
+                    self.send_json({"ok": False, "error": "endpoint_id 不能为空"}, HTTPStatus.BAD_REQUEST)
+                    return
+                ui_cfg = load_ui_config()
+                ui_cfg["connection_enabled"] = True
+                write_json(DATA_DIR / "ui_auth.json", ui_cfg)
+                self.send_json({"ok": True, "message": connect_pool_endpoint(endpoint_id), "state": get_state()})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         elif effective_path == "/api/connect":
