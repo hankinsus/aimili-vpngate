@@ -2083,26 +2083,70 @@ def protocol_probe_loop() -> None:
             log_to_json("ERROR", "Probe", f"多协议热备探测循环异常: {exc}")
         time.sleep(PROTOCOL_PROBE_INTERVAL_SECONDS)
 
-def try_pool_failover(exclude_endpoint_id: str = "", attempts: int = 3) -> bool:
-    candidates = node_pool.list_endpoints(limit=50)
-    usable = [
-        ep for ep in candidates
-        if ep.get("protocol") in ("softether", "sstp", "l2tp-ipsec")
-        and ep.get("status") in ("HOT", "AVAILABLE")
-        and ep.get("endpoint_id") != exclude_endpoint_id
+def openvpn_pool_endpoint_id(node: dict[str, Any] | None) -> str:
+    if not node:
+        return ""
+    try:
+        key = node_pool.server_key(node)
+        return node_pool.endpoint_id(
+            key,
+            "openvpn",
+            str(node.get("proto") or "unknown").lower(),
+            parse_int(node.get("remote_port")),
+        )
+    except Exception:
+        return ""
+
+def connect_ranked_endpoint(endpoint: dict[str, Any]) -> str:
+    protocol = str(endpoint.get("protocol") or "").lower()
+    if protocol == "openvpn":
+        metadata = endpoint.get("metadata") or {}
+        node_id = str(metadata.get("node_id") or "").strip()
+        if not node_id:
+            raise RuntimeError("OpenVPN Hot Pool 端点缺少 node_id")
+        return connect_node(node_id)
+    return connect_pool_endpoint(str(endpoint.get("endpoint_id") or ""))
+
+def endpoint_allowed_by_pool_routing(endpoint: dict[str, Any], ui_cfg: dict[str, Any]) -> bool:
+    routing_mode = ui_cfg.get("routing_mode", "auto")
+    if routing_mode in ("fixed_ip", "favorites"):
+        return False
+    if routing_mode == "fixed_region":
+        target_country = ui_cfg.get("force_country", "")
+        if target_country and not country_matches(endpoint.get("country"), target_country):
+            return False
+
+    routing_ip_type = ui_cfg.get("routing_ip_type", "all")
+    if routing_ip_type != "all":
+        server_meta = endpoint.get("server_metadata") or {}
+        ip_type = str(server_meta.get("ip_type") or "")
+        if routing_ip_type == "residential" and ip_type not in ("residential", "mobile"):
+            return False
+        if routing_ip_type == "hosting" and ip_type != "hosting":
+            return False
+    return True
+
+def try_unified_failover(exclude_endpoint_id: str = "", attempts: int = 4) -> bool:
+    ui_cfg = load_ui_config()
+    hot_pool = [
+        ep for ep in node_pool.ranked_hot_pool(limit=12, per_server_limit=2)
+        if ep.get("endpoint_id") != exclude_endpoint_id
+        and endpoint_allowed_by_pool_routing(ep, ui_cfg)
     ]
-    # Prefer lower measured latency and lower jitter among validated endpoints.
-    usable.sort(key=lambda ep: (
-        float(ep.get("latency_ewma") or 999999),
-        float(ep.get("jitter_ewma") or 999999),
-        -float(ep.get("last_success") or 0),
-    ))
-    for endpoint in usable[:max(1, attempts)]:
+    for endpoint in hot_pool[:max(1, attempts)]:
         try:
-            connect_pool_endpoint(str(endpoint.get("endpoint_id") or ""))
+            connect_ranked_endpoint(endpoint)
+            set_state(
+                hot_pool_size=len(hot_pool),
+                hot_pool_selected_score=endpoint.get("selection_score", 0),
+            )
             return True
         except Exception as exc:
-            log_to_json("WARNING", "VPN", f"热备协议端点切换失败 {endpoint.get('endpoint_id')}: {exc}")
+            log_to_json(
+                "WARNING",
+                "VPN",
+                f"统一 Hot Pool 切换失败 {endpoint.get('protocol')} {endpoint.get('endpoint_id')}: {exc}",
+            )
     return False
 
 def maintain_valid_nodes(force: bool = False) -> str:
@@ -5486,20 +5530,27 @@ def background_proxy_checker() -> None:
                     except Exception:
                         pass
                     stop_active_external_tunnel()
-                    if not try_pool_failover(exclude_endpoint_id=failed_endpoint, attempts=3):
+                    if not try_unified_failover(exclude_endpoint_id=failed_endpoint, attempts=3):
                         auto_switch_node()
                 elif active_openvpn_node_id:
                     ui_cfg = load_ui_config()
                     routing_mode = ui_cfg.get("routing_mode", "auto")
                     if routing_mode != "fixed_ip":
+                        failed_endpoint = ""
                         with lock:
                             nodes = read_nodes()
                             active_node = next((n for n in nodes if n.get("id") == active_openvpn_node_id), None)
                             if active_node:
+                                failed_endpoint = openvpn_pool_endpoint_id(active_node)
                                 mark_blacklisted(active_node, f"代理连续连通性检测失败: {error_msg}")
                                 active_node["probe_status"] = "unavailable"
                                 write_json(NODES_FILE, nodes)
-                        auto_switch_node()
+                                try:
+                                    node_pool.record_probe(active_node, False, 0, error_msg)
+                                except Exception:
+                                    pass
+                        if not try_unified_failover(exclude_endpoint_id=failed_endpoint, attempts=4):
+                            auto_switch_node()
                     else:
                         print(f"[代理守护线程] 固定 IP 模式下代理连续不可用，正在尝试重启连接同一节点: {active_openvpn_node_id}", flush=True)
                         is_connecting = False
@@ -5683,6 +5734,14 @@ class Handler(BaseHTTPRequestHandler):
                 protocol = str((query.get("protocol") or [""])[0]).strip().lower() or None
                 limit = bounded_int((query.get("limit") or ["100"])[0], 100, 1, 500)
                 self.send_json({"ok": True, "endpoints": node_pool.list_endpoints(protocol=protocol, limit=limit)})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+        elif effective_path == "/api/hot_pool":
+            try:
+                query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+                limit = bounded_int((query.get("limit") or ["10"])[0], 10, 1, 20)
+                pool = node_pool.ranked_hot_pool(limit=limit, per_server_limit=2)
+                self.send_json({"ok": True, "hot_pool": pool, "count": len(pool)})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         elif effective_path == "/api/link_probe":
