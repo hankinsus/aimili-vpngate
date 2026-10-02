@@ -6,6 +6,7 @@ import json
 import sqlite3
 import threading
 import time
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 
@@ -67,8 +68,9 @@ class NodePool:
         self.db_path = Path(db_path)
         self.lock = threading.RLock()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as db:
+        with closing(self._connect()) as db:
             db.executescript(_SCHEMA)
+            db.commit()
 
     def _connect(self) -> sqlite3.Connection:
         db = sqlite3.connect(str(self.db_path), timeout=10)
@@ -91,7 +93,7 @@ class NodePool:
     def upsert_openvpn_snapshot(self, nodes: list[dict[str, Any]], source: str = "official_csv") -> None:
         now = time.time()
         seen_keys: set[str] = set()
-        with self.lock, self._connect() as db:
+        with self.lock, closing(self._connect()) as db:
             for node in nodes:
                 key = self.server_key(node)
                 if not key:
@@ -183,7 +185,7 @@ class NodePool:
         eid = self.endpoint_id(key, protocol, transport, port)
         now = time.time()
 
-        with self.lock, self._connect() as db:
+        with self.lock, closing(self._connect()) as db:
             row = db.execute("SELECT * FROM endpoints WHERE endpoint_id=?", (eid,)).fetchone()
             if row is None:
                 return
@@ -211,6 +213,13 @@ class NodePool:
                 fail_streak = int(row["fail_streak"]) + 1
                 backoff = min(7200, 30 * (4 ** min(fail_streak - 1, 4)))
                 status = "DEGRADED" if fail_streak < 3 else "COOLDOWN"
+                try:
+                    endpoint_meta = json.loads(row["metadata_json"] or "{}")
+                    if not isinstance(endpoint_meta, dict):
+                        endpoint_meta = {}
+                except Exception:
+                    endpoint_meta = {}
+                endpoint_meta["last_error"] = message
                 db.execute(
                     """
                     UPDATE endpoints SET status=?, last_failure=?, failure_count=?, fail_streak=?,
@@ -218,14 +227,14 @@ class NodePool:
                     """,
                     (
                         status, now, failure_count, fail_streak, now + backoff,
-                        json.dumps({"last_error": message}, ensure_ascii=False), eid,
+                        json.dumps(endpoint_meta, ensure_ascii=False), eid,
                     ),
                 )
                 db.execute("UPDATE servers SET state=? WHERE server_key=?", (status, key))
             db.commit()
 
     def stats(self) -> dict[str, Any]:
-        with self.lock, self._connect() as db:
+        with self.lock, closing(self._connect()) as db:
             servers = db.execute("SELECT COUNT(*) c FROM servers").fetchone()["c"]
             endpoints = db.execute("SELECT COUNT(*) c FROM endpoints").fetchone()["c"]
             states = {
