@@ -433,10 +433,21 @@ def enrich_ip_info(nodes: list[dict[str, Any]]) -> None:
                     # VPNGate exits are expected to be detected as proxies, including many
                     # volunteer nodes running on residential ISP connections. Treating
                     # proxy=true as hosting incorrectly hides residential nodes.
+                    network_identity = " ".join(
+                        str(item.get(k) or "") for k in ("isp", "org", "asname", "as")
+                    ).lower()
+                    non_residential_hints = (
+                        "university", "college", "school", "education", ".edu",
+                        "hosting", "host", "datacenter", "data center", "cloud",
+                        "amazon", "aws", "google cloud", "microsoft", "azure",
+                        "oracle", "digitalocean", "vultr", "linode", "akamai",
+                        "hetzner", "ovh", "leaseweb", "choopa"
+                    )
+
                     ip_type = "residential"
                     if item.get("mobile"):
                         ip_type = "mobile"
-                    elif item.get("hosting"):
+                    elif item.get("hosting") or any(hint in network_identity for hint in non_residential_hints):
                         ip_type = "hosting"
 
                     quality = "normal"
