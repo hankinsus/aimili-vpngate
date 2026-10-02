@@ -116,6 +116,8 @@ OPENVPN_TEST_TIMEOUT_SECONDS = env_int("OPENVPN_TEST_TIMEOUT_SECONDS", 35, 1)
 MANUAL_TEST_NODE_LIMIT = env_int("MANUAL_TEST_NODE_LIMIT", 5, 1, 20)
 INITIAL_CONNECT_TEST_LIMIT = env_int("INITIAL_CONNECT_TEST_LIMIT", 10, 1, 50)
 BACKGROUND_PROBE_BATCH = env_int("BACKGROUND_PROBE_BATCH", 40, 5, 200)
+PROTOCOL_PROBE_BATCH = env_int("PROTOCOL_PROBE_BATCH", 3, 1, 10)
+PROTOCOL_PROBE_INTERVAL_SECONDS = env_int("PROTOCOL_PROBE_INTERVAL_SECONDS", 300, 60, 3600)
 OPENVPN_CMD = os.environ.get("OPENVPN_CMD", "openvpn")
 OPENVPN_AUTH_USER = os.environ.get("OPENVPN_AUTH_USER", "vpn")
 OPENVPN_AUTH_PASS = os.environ.get("OPENVPN_AUTH_PASS", "vpn")
@@ -144,6 +146,7 @@ active_openvpn_node_id = ""
 active_external_tunnel: tunnel_adapters.TunnelResult | None = None
 active_pool_endpoint_id = ""
 protocol_discovery_lock = threading.Lock()
+protocol_probe_lock = threading.Lock()
 last_protocol_discovery_at = 0.0
 is_connecting = False
 last_active_ping_time = 0.0
@@ -1907,6 +1910,138 @@ def connect_node(node_id: str) -> str:
     finally:
         with lock:
             is_connecting = False
+
+def check_interface_egress(interface: str) -> dict[str, Any]:
+    interface = str(interface or "").strip()
+    if not interface:
+        return {"ok": False, "error": "缺少测试网卡"}
+    cmd = [
+        "curl", "-s",
+        "--interface", f"if!{interface}",
+        "-w", "\n%{time_total} %{http_code}",
+        "http://api.ipify.org",
+        "--max-time", "6",
+    ]
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=7)
+        if res.returncode != 0:
+            return {"ok": False, "error": (res.stderr or f"curl exit {res.returncode}")[-500:]}
+        lines = res.stdout.strip().splitlines()
+        if len(lines) < 2:
+            return {"ok": False, "error": "测试出口没有返回有效结果"}
+        ip = lines[0].strip()
+        timing = lines[-1].split()
+        if len(timing) != 2 or timing[1] != "200":
+            return {"ok": False, "error": f"测试出口 HTTP 异常: {lines[-1]}"}
+        latency_ms = int(float(timing[0]) * 1000)
+        return {"ok": True, "ip": ip, "latency_ms": latency_ms}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+def probe_pool_endpoint(endpoint_id: str) -> dict[str, Any]:
+    endpoint_id = str(endpoint_id or "").strip()
+    if not endpoint_id:
+        return {"ok": False, "error": "endpoint_id 为空"}
+    if is_connecting:
+        return {"ok": False, "skipped": True, "error": "生产连接正在切换，跳过后台探测"}
+    if not protocol_probe_lock.acquire(blocking=False):
+        return {"ok": False, "skipped": True, "error": "已有协议探测任务运行中"}
+
+    endpoint = node_pool.get_endpoint(endpoint_id)
+    if endpoint is None:
+        protocol_probe_lock.release()
+        return {"ok": False, "error": "端点不存在"}
+
+    protocol = str(endpoint.get("protocol") or "").lower()
+    metadata = endpoint.get("metadata") or {}
+    host = str(metadata.get("hostname") or endpoint.get("hostname") or endpoint.get("current_ip") or "").strip()
+    port = parse_int(endpoint.get("port"))
+    token = re.sub(r"[^a-z0-9]", "", endpoint_id.lower())[:10] or uuid.uuid4().hex[:10]
+    result: tunnel_adapters.TunnelResult | None = None
+    cleanup = None
+
+    try:
+        if protocol == "softether":
+            account = f"probe{token}"
+            nic = f"p{token}"
+            adapter = tunnel_adapters.SoftEtherAdapter()
+            result = adapter.connect(
+                host=host,
+                port=port or 443,
+                account=account,
+                nic=nic,
+                username="vpn",
+                password="vpn",
+            )
+            cleanup = lambda: adapter.disconnect(account=account, nic=nic, delete=True)
+        elif protocol == "sstp":
+            adapter = tunnel_adapters.SSTPAdapter()
+            target = host if port in (0, 443) else f"{host}:{port}"
+            result = adapter.connect(target, username="vpn", password="vpn", timeout=20)
+            cleanup = lambda: tunnel_adapters.SSTPAdapter.disconnect(result.process if result else None)
+        else:
+            return {"ok": False, "skipped": True, "error": f"协议 {protocol} 暂不允许后台实连测试"}
+
+        if result is None or not result.ok or not result.interface:
+            message = result.message if result else "隧道未建立"
+            node_pool.record_endpoint_probe(endpoint_id, False, 0, message)
+            return {"ok": False, "protocol": protocol, "error": message}
+
+        egress = check_interface_egress(result.interface)
+        if not egress.get("ok"):
+            message = str(egress.get("error") or "接口出口不可用")
+            node_pool.record_endpoint_probe(endpoint_id, False, 0, message)
+            return {"ok": False, "protocol": protocol, "interface": result.interface, "error": message}
+
+        latency_ms = parse_int(egress.get("latency_ms"))
+        node_pool.record_endpoint_probe(endpoint_id, True, latency_ms, "background egress probe ok")
+        return {
+            "ok": True,
+            "protocol": protocol,
+            "interface": result.interface,
+            "ip": egress.get("ip", ""),
+            "latency_ms": latency_ms,
+        }
+    except Exception as exc:
+        try:
+            node_pool.record_endpoint_probe(endpoint_id, False, 0, str(exc))
+        except Exception:
+            pass
+        return {"ok": False, "protocol": protocol, "error": str(exc)}
+    finally:
+        if cleanup is not None:
+            try:
+                cleanup()
+            except Exception:
+                pass
+        protocol_probe_lock.release()
+
+def protocol_probe_loop() -> None:
+    # Give the production gateway time to establish its first route before
+    # starting low-priority standby validation.
+    time.sleep(90)
+    while True:
+        try:
+            if is_connecting:
+                time.sleep(15)
+                continue
+            limit = 2 if active_tunnel_running() else PROTOCOL_PROBE_BATCH
+            due = node_pool.due_endpoints(("softether", "sstp"), limit=limit)
+            if due:
+                log_to_json("INFO", "Probe", f"多协议热备低频探测，本轮 {len(due)} 个端点")
+            for endpoint in due:
+                if is_connecting:
+                    break
+                endpoint_id = str(endpoint.get("endpoint_id") or "")
+                result = probe_pool_endpoint(endpoint_id)
+                if result.get("ok"):
+                    log_to_json("INFO", "Probe", f"热备端点可用 {endpoint_id}: {result}")
+                elif not result.get("skipped"):
+                    log_to_json("WARNING", "Probe", f"热备端点不可用 {endpoint_id}: {result.get('error')}")
+                time.sleep(2)
+        except Exception as exc:
+            log_to_json("ERROR", "Probe", f"多协议热备探测循环异常: {exc}")
+        time.sleep(PROTOCOL_PROBE_INTERVAL_SECONDS)
 
 def try_pool_failover(exclude_endpoint_id: str = "", attempts: int = 3) -> bool:
     candidates = node_pool.list_endpoints(limit=50)
@@ -6133,6 +6268,7 @@ def main() -> None:
     threading.Thread(target=collector_loop, daemon=True).start()
     threading.Thread(target=background_proxy_checker, daemon=True).start()
     threading.Thread(target=active_node_pinger, daemon=True).start()
+    threading.Thread(target=protocol_probe_loop, daemon=True).start()
     
     ui_cfg = load_ui_config()
     ui_host = ui_cfg.get("host", UI_HOST)
