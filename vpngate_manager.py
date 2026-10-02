@@ -1775,6 +1775,12 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
                     "probe_message": f"Test exception: {e}",
                     "latency_ms": 0
                 }
+                try:
+                    original_node = next((item for item in to_test if item.get("id") == nid), None)
+                    if original_node:
+                        node_pool.record_probe(original_node, False, 0, f"Test exception: {e}")
+                except Exception as pool_exc:
+                    log_to_json("WARNING", "Main", f"NodePool 异常探测结果写入失败: {pool_exc}")
 
             # Avoid re-reading and rewriting the entire nodes.json after every
             # single probe completion. Flush small batches so the UI remains
