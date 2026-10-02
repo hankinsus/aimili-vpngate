@@ -421,11 +421,11 @@ cleanup() {{
     echo "d vpngate" > "{control_file}"
   fi
   ipsec down vpngate >/dev/null 2>&1 || true
-  if [ -n "${XL2TP_PID:-}" ]; then
+  if [ -n "${{XL2TP_PID:-}}" ]; then
     kill "$XL2TP_PID" >/dev/null 2>&1 || true
     wait "$XL2TP_PID" >/dev/null 2>&1 || true
   fi
-  if [ -n "${STARTER_PID:-}" ]; then
+  if [ -n "${{STARTER_PID:-}}" ]; then
     kill "$STARTER_PID" >/dev/null 2>&1 || true
     wait "$STARTER_PID" >/dev/null 2>&1 || true
   fi
@@ -487,9 +487,7 @@ exit 42
                 ["iptables", "-A", "FORWARD", "-d", subnet, "-i", physical, "-m", "state", "--state", "ESTABLISHED,RELATED", "-j", "ACCEPT"],
             ]
             for rule in nat_rules:
-                check_rule = rule.copy()
-                check_rule[2 if rule[1] != "-t" else 4] = "-C"
-                # Simpler idempotency: deletion was done in disconnect(), so add once.
+                # disconnect() removes the deterministic rules first, so add once.
                 self._run(rule, timeout=4, check=True)
 
             proc = subprocess.Popen(
@@ -510,6 +508,7 @@ exit 42
                     except Exception:
                         pass
                     self.disconnect(namespace)
+                    shutil.rmtree(work_dir, ignore_errors=True)
                     return TunnelResult(False, self.protocol, message=output or "L2TP helper exited before PPP became ready")
                 if ready.exists() and iface_file.exists():
                     inner_iface = iface_file.read_text(encoding="utf-8").strip()
@@ -530,11 +529,16 @@ exit 42
                 time.sleep(0.5)
 
             self.disconnect(namespace)
+            shutil.rmtree(work_dir, ignore_errors=True)
             return TunnelResult(False, self.protocol, message=f"L2TP/IPsec connection timed out after {timeout}s")
         except Exception as exc:
             self._cleanup_iptables(subnet, physical)
             try:
                 subprocess.run(["ip", "netns", "del", namespace], capture_output=True, timeout=5)
+            except Exception:
+                pass
+            try:
+                subprocess.run(["ip", "link", "del", host_veth], capture_output=True, timeout=5)
             except Exception:
                 pass
             try:
@@ -569,6 +573,10 @@ exit 42
 
         try:
             subprocess.run(["ip", "netns", "del", namespace], capture_output=True, timeout=6)
+        except Exception:
+            pass
+        try:
+            subprocess.run(["ip", "link", "del", f"alh{token}"[:15]], capture_output=True, timeout=5)
         except Exception:
             pass
         self._cleanup_iptables(subnet, physical)
