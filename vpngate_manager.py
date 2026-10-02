@@ -140,6 +140,7 @@ UPSTREAM_PROXY_AUTH_FILE = DATA_DIR / "upstream_proxy_auth.txt"
 BLACKLIST_FILE = DATA_DIR / "blacklist.json"
 NODE_POOL_DB = DATA_DIR / "node_pool.sqlite3"
 node_pool = NodePool(NODE_POOL_DB)
+l2tp_adapter = tunnel_adapters.L2TPIPsecAdapter()
 
 lock = threading.RLock()
 maintenance_lock = threading.Lock()
@@ -1132,7 +1133,7 @@ def run_openvpn_until_ready(config_file: str, keep_alive: bool, route_nopull: bo
     return ok, message, process
 
 
-def setup_policy_routing(interface: str = "tun0") -> None:
+def setup_policy_routing(interface: str = "tun0", gateway: str = "") -> None:
     try:
         subprocess.run(["ip", "rule", "del", "table", "100"], capture_output=True, timeout=2)
     except Exception:
@@ -1145,7 +1146,11 @@ def setup_policy_routing(interface: str = "tun0") -> None:
     success = False
     for attempt in range(1, 4):
         try:
-            subprocess.run(["ip", "route", "add", "default", "dev", interface, "table", "100"], check=True, timeout=2)
+            route_cmd = ["ip", "route", "add", "default"]
+            if gateway:
+                route_cmd.extend(["via", gateway])
+            route_cmd.extend(["dev", interface, "table", "100"])
+            subprocess.run(route_cmd, check=True, timeout=2)
             subprocess.run(["ip", "rule", "add", "oif", interface, "table", "100"], check=True, timeout=2)
             # 配置反向路径过滤 rp_filter 为 loose 模式 (2)，防止回包被内核静默丢弃
             for proc_path in ["all", "default", interface]:
@@ -1219,6 +1224,8 @@ def stop_active_external_tunnel() -> None:
             tunnel_adapters.SoftEtherAdapter().disconnect()
         elif tunnel.protocol == "sstp":
             tunnel_adapters.SSTPAdapter.disconnect(tunnel.process)
+        elif tunnel.protocol == "l2tp-ipsec":
+            l2tp_adapter.disconnect(tunnel.namespace or "aimili-l2tp-prod")
     except Exception as exc:
         log_to_json("WARNING", "VPN", f"停止 {tunnel.protocol} 隧道失败: {exc}")
     cleanup_policy_routing()
@@ -1263,7 +1270,7 @@ def connect_pool_endpoint(endpoint_id: str) -> str:
     if endpoint is None:
         raise ValueError("Protocol endpoint not found")
     protocol = str(endpoint.get("protocol") or "").lower()
-    if protocol not in ("softether", "sstp"):
+    if protocol not in ("softether", "sstp", "l2tp-ipsec"):
         raise RuntimeError(f"协议 {protocol} 当前尚未开放生产连接")
 
     with lock:
@@ -1291,12 +1298,21 @@ def connect_pool_endpoint(endpoint_id: str) -> str:
                 username="vpn",
                 password="vpn",
             )
-        else:
+        elif protocol == "sstp":
             result = tunnel_adapters.SSTPAdapter().connect(
                 hostname=host if port in (0, 443) else f"{host}:{port}",
                 username="vpn",
                 password="vpn",
                 timeout=20,
+            )
+        else:
+            result = l2tp_adapter.connect(
+                host=host,
+                username="vpn",
+                password="vpn",
+                psk="vpn",
+                namespace="aimili-l2tp-prod",
+                timeout=35,
             )
 
         if not result.ok or not result.interface:
@@ -1307,7 +1323,7 @@ def connect_pool_endpoint(endpoint_id: str) -> str:
         active_pool_endpoint_id = endpoint_id
         active_openvpn_node_id = ""
         proxy_server.set_active_interface(result.interface)
-        setup_policy_routing(result.interface)
+        setup_policy_routing(result.interface, gateway=result.gateway)
 
         health = check_proxy_health()
         if not health.get("ok"):
@@ -1988,6 +2004,17 @@ def probe_pool_endpoint(endpoint_id: str) -> dict[str, Any]:
             target = host if port in (0, 443) else f"{host}:{port}"
             result = adapter.connect(target, username="vpn", password="vpn", timeout=20)
             cleanup = lambda: tunnel_adapters.SSTPAdapter.disconnect(result.process if result else None)
+        elif protocol == "l2tp-ipsec":
+            namespace = f"aimili-l2tp-p{token}"[:31]
+            result = l2tp_adapter.connect(
+                host=host,
+                username="vpn",
+                password="vpn",
+                psk="vpn",
+                namespace=namespace,
+                timeout=35,
+            )
+            cleanup = lambda: l2tp_adapter.disconnect(namespace)
         else:
             return {"ok": False, "skipped": True, "error": f"协议 {protocol} 暂不允许后台实连测试"}
 
@@ -1996,7 +2023,11 @@ def probe_pool_endpoint(endpoint_id: str) -> dict[str, Any]:
             node_pool.record_endpoint_probe(endpoint_id, False, 0, message)
             return {"ok": False, "protocol": protocol, "error": message}
 
-        egress = check_interface_egress(result.interface)
+        egress = (
+            tunnel_adapters.L2TPIPsecAdapter.egress_check(result)
+            if protocol == "l2tp-ipsec"
+            else check_interface_egress(result.interface)
+        )
         if not egress.get("ok"):
             message = str(egress.get("error") or "接口出口不可用")
             node_pool.record_endpoint_probe(endpoint_id, False, 0, message)
@@ -2035,7 +2066,7 @@ def protocol_probe_loop() -> None:
                 time.sleep(15)
                 continue
             limit = 2 if active_tunnel_running() else PROTOCOL_PROBE_BATCH
-            due = node_pool.due_endpoints(("softether", "sstp"), limit=limit)
+            due = node_pool.due_endpoints(("softether", "sstp", "l2tp-ipsec"), limit=limit)
             if due:
                 log_to_json("INFO", "Probe", f"多协议热备低频探测，本轮 {len(due)} 个端点")
             for endpoint in due:
@@ -2056,7 +2087,7 @@ def try_pool_failover(exclude_endpoint_id: str = "", attempts: int = 3) -> bool:
     candidates = node_pool.list_endpoints(limit=50)
     usable = [
         ep for ep in candidates
-        if ep.get("protocol") in ("softether", "sstp")
+        if ep.get("protocol") in ("softether", "sstp", "l2tp-ipsec")
         and ep.get("status") in ("HOT", "AVAILABLE")
         and ep.get("endpoint_id") != exclude_endpoint_id
     ]
