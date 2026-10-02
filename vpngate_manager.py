@@ -1149,7 +1149,10 @@ def setup_policy_routing(interface: str = "tun0", gateway: str = "") -> None:
             route_cmd = ["ip", "route", "add", "default"]
             if gateway:
                 route_cmd.extend(["via", gateway])
-            route_cmd.extend(["dev", interface, "table", "100"])
+            route_cmd.extend(["dev", interface])
+            if gateway:
+                route_cmd.append("onlink")
+            route_cmd.extend(["table", "100"])
             subprocess.run(route_cmd, check=True, timeout=2)
             subprocess.run(["ip", "rule", "add", "oif", interface, "table", "100"], check=True, timeout=2)
             # 配置反向路径过滤 rp_filter 为 loose 模式 (2)，防止回包被内核静默丢弃
