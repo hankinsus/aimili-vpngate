@@ -1214,6 +1214,7 @@ def stop_active_external_tunnel() -> None:
     except Exception as exc:
         log_to_json("WARNING", "VPN", f"停止 {tunnel.protocol} 隧道失败: {exc}")
     cleanup_policy_routing()
+    proxy_server.clear_active_interface()
     active_external_tunnel = None
     active_pool_endpoint_id = ""
     set_state(active_pool_endpoint_id="", active_tunnel_protocol="", active_tunnel_interface="")
@@ -1906,6 +1907,28 @@ def connect_node(node_id: str) -> str:
     finally:
         with lock:
             is_connecting = False
+
+def try_pool_failover(exclude_endpoint_id: str = "", attempts: int = 3) -> bool:
+    candidates = node_pool.list_endpoints(limit=50)
+    usable = [
+        ep for ep in candidates
+        if ep.get("protocol") in ("softether", "sstp")
+        and ep.get("status") in ("HOT", "AVAILABLE")
+        and ep.get("endpoint_id") != exclude_endpoint_id
+    ]
+    # Prefer lower measured latency and lower jitter among validated endpoints.
+    usable.sort(key=lambda ep: (
+        float(ep.get("latency_ewma") or 999999),
+        float(ep.get("jitter_ewma") or 999999),
+        -float(ep.get("last_success") or 0),
+    ))
+    for endpoint in usable[:max(1, attempts)]:
+        try:
+            connect_pool_endpoint(str(endpoint.get("endpoint_id") or ""))
+            return True
+        except Exception as exc:
+            log_to_json("WARNING", "VPN", f"热备协议端点切换失败 {endpoint.get('endpoint_id')}: {exc}")
+    return False
 
 def maintain_valid_nodes(force: bool = False) -> str:
     global active_openvpn_process, active_openvpn_node_id, is_connecting
@@ -5234,7 +5257,16 @@ def background_proxy_checker() -> None:
                 )
 
                 # Only confirmed failures can trigger production failover.
-                if active_openvpn_node_id:
+                if active_pool_endpoint_id:
+                    failed_endpoint = active_pool_endpoint_id
+                    try:
+                        node_pool.record_endpoint_probe(failed_endpoint, False, 0, error_msg)
+                    except Exception:
+                        pass
+                    stop_active_external_tunnel()
+                    if not try_pool_failover(exclude_endpoint_id=failed_endpoint, attempts=3):
+                        auto_switch_node()
+                elif active_openvpn_node_id:
                     ui_cfg = load_ui_config()
                     routing_mode = ui_cfg.get("routing_mode", "auto")
                     if routing_mode != "fixed_ip":
@@ -5918,7 +5950,15 @@ class Handler(BaseHTTPRequestHandler):
                 global last_active_ping_time, last_active_latency
                 last_active_ping_time = 0.0
                 last_active_latency = 0
-                set_state(active_openvpn_node_id="", last_check_message="手动断开连接", active_node_latency="无活动连接")
+                proxy_server.clear_active_interface()
+                set_state(
+                    active_openvpn_node_id="",
+                    active_pool_endpoint_id="",
+                    active_tunnel_protocol="",
+                    active_tunnel_interface="",
+                    last_check_message="手动断开连接",
+                    active_node_latency="无活动连接",
+                )
                 self.send_json({"ok": True})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
