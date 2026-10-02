@@ -166,6 +166,14 @@ class SoftEtherAdapter:
             return TunnelResult(False, self.protocol, message="vpnclient/vpncmd not installed")
         before = list_interfaces()
         try:
+            # Ubuntu/Debian package normally gets /run/softether from systemd's
+            # RuntimeDirectory=. When we intentionally keep the global service
+            # disabled, create the runtime directory before starting vpnclient.
+            try:
+                Path("/run/softether").mkdir(parents=True, exist_ok=True)
+                Path("/run/softether").chmod(0o755)
+            except OSError:
+                pass
             subprocess.run(["vpnclient", "start"], capture_output=True, text=True, timeout=8)
             # Idempotent cleanup. These commands may fail when entries do not exist.
             self._vpncmd("AccountDisconnect", account, timeout=5)
