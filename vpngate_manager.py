@@ -115,9 +115,10 @@ MAX_SCAN_ROWS = env_int("MAX_SCAN_ROWS", 5000, 1)
 OPENVPN_TEST_TIMEOUT_SECONDS = env_int("OPENVPN_TEST_TIMEOUT_SECONDS", 35, 1)
 MANUAL_TEST_NODE_LIMIT = env_int("MANUAL_TEST_NODE_LIMIT", 5, 1, 20)
 INITIAL_CONNECT_TEST_LIMIT = env_int("INITIAL_CONNECT_TEST_LIMIT", 10, 1, 50)
-BACKGROUND_PROBE_BATCH = env_int("BACKGROUND_PROBE_BATCH", 40, 5, 200)
+BACKGROUND_PROBE_BATCH = env_int("BACKGROUND_PROBE_BATCH", 20, 5, 100)
+ACTIVE_BACKGROUND_PROBE_BATCH = env_int("ACTIVE_BACKGROUND_PROBE_BATCH", 3, 1, 20)
 PROTOCOL_PROBE_BATCH = env_int("PROTOCOL_PROBE_BATCH", 3, 1, 10)
-PROTOCOL_PROBE_INTERVAL_SECONDS = env_int("PROTOCOL_PROBE_INTERVAL_SECONDS", 300, 60, 3600)
+PROTOCOL_PROBE_INTERVAL_SECONDS = env_int("PROTOCOL_PROBE_INTERVAL_SECONDS", 600, 120, 3600)
 HOT_POOL_TARGET = env_int("HOT_POOL_TARGET", 8, 5, 10)
 LINK_PROBE_MAX_BYTES = env_int("LINK_PROBE_MAX_BYTES", 1048576, 65536, 4194304)
 LINK_PROBE_WINDOW_BYTES = env_int("LINK_PROBE_WINDOW_BYTES", 4194304, 262144, 16777216)
@@ -2135,7 +2136,7 @@ def protocol_probe_loop() -> None:
             deficit = max(0, HOT_POOL_TARGET - len(current_hot))
             if deficit > 0:
                 desired = min(PROTOCOL_PROBE_BATCH, max(1, deficit))
-                limit = min(2, desired) if active_tunnel_running() else desired
+                limit = 1 if active_tunnel_running() else desired
             else:
                 # Pool is healthy: validate only one due non-OpenVPN endpoint
                 # per cycle so new protocol resources still get a chance.
@@ -2403,22 +2404,28 @@ def maintain_valid_nodes(force: bool = False) -> str:
                         return message
                     is_connecting = True
 
-        # Test remaining non-active nodes from the list
-        with lock:
-            current_nodes = read_nodes()
-            to_test = [
-                n for n in current_nodes
-                if not n.get("active") and n.get("id") not in initial_tested_ids
-            ]
-            # Never sweep a large pool in one burst. Probe the stalest entries
-            # first and rotate through the pool across maintenance cycles.
-            to_test.sort(key=lambda n: float(n.get("probed_at", 0) or 0))
-            total_due = len(to_test)
-            batch_limit = BACKGROUND_PROBE_BATCH if active_tunnel_running() else max(BACKGROUND_PROBE_BATCH, INITIAL_CONNECT_TEST_LIMIT * 2)
-            to_test = to_test[:batch_limit]
-            to_test_ids = [n["id"] for n in to_test]
+        # Test only OpenVPN endpoints whose lifecycle backoff has expired.
+        # This prevents repeatedly reconnecting every failed node on each cycle.
+        batch_limit = (
+            ACTIVE_BACKGROUND_PROBE_BATCH
+            if active_tunnel_running()
+            else max(BACKGROUND_PROBE_BATCH, INITIAL_CONNECT_TEST_LIMIT * 2)
+        )
+        due_openvpn = node_pool.due_endpoints(("openvpn",), limit=batch_limit + len(initial_tested_ids))
+        to_test_ids: list[str] = []
+        seen_test_ids: set[str] = set()
+        for endpoint in due_openvpn:
+            metadata = endpoint.get("metadata") or {}
+            node_id = str(metadata.get("node_id") or "").strip()
+            if not node_id or node_id in initial_tested_ids or node_id in seen_test_ids:
+                continue
+            to_test_ids.append(node_id)
+            seen_test_ids.add(node_id)
+            if len(to_test_ids) >= batch_limit:
+                break
+        total_due = len(due_openvpn)
             
-        msg = f"开始低频轮询候选节点，本轮检测 {len(to_test_ids)}/{total_due} 个（优先最久未检测），避免影响生产代理"
+        msg = f"开始按退避队列低频轮询 OpenVPN，本轮检测 {len(to_test_ids)} 个到期节点（查询到 {total_due} 个候选），避免重复扫描与连接风暴"
         print(f"[周期检测] {msg}", flush=True)
         log_to_json("INFO", "Main", msg)
         
