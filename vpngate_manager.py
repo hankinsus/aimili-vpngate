@@ -1279,6 +1279,9 @@ def connect_pool_endpoint(endpoint_id: str) -> str:
     if endpoint is None:
         raise ValueError("Protocol endpoint not found")
     protocol = str(endpoint.get("protocol") or "").lower()
+    metadata = endpoint.get("metadata") or {}
+    if protocol != "openvpn" and not metadata.get("trusted_observation"):
+        raise RuntimeError("该协议端点目前仅由单一 Mirror 发现，尚未通过主站或多源交叉确认")
     if protocol not in ("softether", "sstp", "l2tp-ipsec"):
         raise RuntimeError(f"协议 {protocol} 当前尚未开放生产连接")
 
