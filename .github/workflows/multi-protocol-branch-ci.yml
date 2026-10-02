@@ -68,6 +68,9 @@ jobs:
                           {"protocol": "openvpn", "transport": "udp", "port": 1195},
                           {"protocol": "softether", "transport": "tcp", "port": 443},
                       ],
+                      "trusted_observation": True,
+                      "source_count": 2,
+                      "_sources": ["https://www.vpngate.net/en/", "https://mirror.example/en/"],
                   },
                   {
                       "hostname": "vpn200.opengw.net",
@@ -80,6 +83,24 @@ jobs:
                       "protocols": [
                           {"protocol": "sstp", "transport": "tcp", "port": 443},
                       ],
+                      "trusted_observation": True,
+                      "source_count": 1,
+                      "_sources": ["https://www.vpngate.net/en/"],
+                  },
+                  {
+                      "hostname": "vpn300.opengw.net",
+                      "ip": "192.0.2.30",
+                      "country": "US",
+                      "ping": 20,
+                      "speed": 900_000_000,
+                      "sessions": 1,
+                      "score": 5000,
+                      "protocols": [
+                          {"protocol": "softether", "transport": "tcp", "port": 443},
+                      ],
+                      "trusted_observation": False,
+                      "source_count": 1,
+                      "_sources": ["https://mirror-only.example/en/"],
                   },
               ])
 
@@ -94,10 +115,18 @@ jobs:
                   pool.record_endpoint_probe(soft["endpoint_id"], True, 60, "ok")
                   pool.record_endpoint_probe(sstp["endpoint_id"], True, 45, "ok")
 
-              hot = pool.ranked_hot_pool(limit=3, per_server_limit=1)
+              mirror_only = [
+                  e for e in pool.list_endpoints("softether", 10)
+                  if e["server_key"] == "vpn300.opengw.net"
+              ][0]
+              for _ in range(3):
+                  pool.record_endpoint_probe(mirror_only["endpoint_id"], True, 20, "synthetic")
+              hot = pool.ranked_hot_pool(limit=5, per_server_limit=1)
               assert hot, "hot pool empty"
               assert len({e["server_key"] for e in hot}) == len(hot), hot
               assert all("selection_score" in e for e in hot), hot
+              assert all(e["server_key"] != "vpn300.opengw.net" for e in hot), hot
+              assert any(e["protocol"] == "sstp" for e in hot), hot
               print([(e["protocol"], e["server_key"], e["selection_score"]) for e in hot])
           PY
       - name: VPNGate HTML protocol parser smoke test
