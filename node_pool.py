@@ -547,6 +547,10 @@ class NodePool:
             ep for ep in self.list_endpoints(limit=1000)
             if str(ep.get("protocol") or "").lower() in protocol_set
             and ep.get("status") in ("HOT", "AVAILABLE")
+            and (
+                str(ep.get("protocol") or "").lower() == "openvpn"
+                or bool((ep.get("metadata") or {}).get("trusted_observation"))
+            )
         ]
         now = time.time()
         for endpoint in candidates:
@@ -660,7 +664,9 @@ class NodePool:
         if not wanted:
             return []
         placeholders = ",".join("?" for _ in wanted)
-        params: list[Any] = [*wanted, now, max(1, min(int(limit), 200))]
+        requested_limit = max(1, min(int(limit), 200))
+        fetch_limit = min(1000, max(50, requested_limit * 8))
+        params: list[Any] = [*wanted, now, fetch_limit]
         with self.lock, closing(self._connect()) as db:
             rows = db.execute(
                 f"""
@@ -694,7 +700,7 @@ class NodePool:
             if endpoint.get("protocol") != "openvpn" and not metadata.get("trusted_observation"):
                 continue
             result.append(endpoint)
-            if len(result) >= max(1, min(int(limit), 200)):
+            if len(result) >= requested_limit:
                 break
         return result
 
