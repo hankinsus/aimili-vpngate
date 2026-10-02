@@ -133,7 +133,7 @@ class NodePool:
                       last_seen=excluded.last_seen,
                       last_source=excluded.last_source,
                       missing_count=0,
-                      state=CASE WHEN servers.state='RETIRED' THEN 'NEW' ELSE servers.state END,
+                      state=CASE WHEN servers.state IN ('RETIRED','STALE') THEN 'NEW' ELSE servers.state END,
                       metadata_json=excluded.metadata_json
                     """,
                     (key, hostname, ip, country, now, now, source, 0, "NEW", json.dumps(metadata, ensure_ascii=False)),
@@ -173,7 +173,7 @@ class NodePool:
                         ON CONFLICT(endpoint_id) DO UPDATE SET
                           last_seen=excluded.last_seen,
                           metadata_json=excluded.metadata_json,
-                          status=CASE WHEN endpoints.status='RETIRED' THEN 'NEW' ELSE endpoints.status END
+                          status=CASE WHEN endpoints.status IN ('RETIRED','STALE') THEN 'NEW' ELSE endpoints.status END
                         """,
                         (eid, key, protocol, transport, port, "NEW", now, now, json.dumps(endpoint_meta, ensure_ascii=False)),
                     )
@@ -289,7 +289,7 @@ class NodePool:
                       last_seen=excluded.last_seen,
                       last_source=excluded.last_source,
                       missing_count=0,
-                      state=CASE WHEN servers.state='RETIRED' THEN 'NEW' ELSE servers.state END,
+                      state=CASE WHEN servers.state IN ('RETIRED','STALE') THEN 'NEW' ELSE servers.state END,
                       metadata_json=excluded.metadata_json
                     """,
                     (key, hostname, ip, country, now, now, source, 0, "NEW", json.dumps(meta, ensure_ascii=False)),
@@ -323,7 +323,7 @@ class NodePool:
                       last_seen=excluded.last_seen,
                       config_ref=excluded.config_ref,
                       metadata_json=excluded.metadata_json,
-                      status=CASE WHEN endpoints.status='RETIRED' THEN 'NEW' ELSE endpoints.status END
+                      status=CASE WHEN endpoints.status IN ('RETIRED','STALE') THEN 'NEW' ELSE endpoints.status END
                     """,
                     (eid, key, protocol, transport, port, str(node.get("config_file") or ""), "NEW", now, now, json.dumps(endpoint_meta, ensure_ascii=False)),
                 )
@@ -472,12 +472,69 @@ class NodePool:
         }
         return final, details
 
+    def age_lifecycle(
+        self,
+        stale_after_seconds: int = 6 * 3600,
+        retire_after_seconds: int = 72 * 3600,
+    ) -> dict[str, int]:
+        now = time.time()
+        stale_cutoff = now - max(3600, int(stale_after_seconds))
+        retire_cutoff = now - max(int(stale_after_seconds) + 3600, int(retire_after_seconds))
+        with self.lock, closing(self._connect()) as db:
+            retired = db.execute(
+                """
+                UPDATE endpoints
+                SET status='RETIRED'
+                WHERE status NOT IN ('RETIRED')
+                  AND last_seen < ?
+                  AND (last_success=0 OR last_success < ?)
+                """,
+                (retire_cutoff, retire_cutoff),
+            ).rowcount
+            stale = db.execute(
+                """
+                UPDATE endpoints
+                SET status='STALE'
+                WHERE status IN ('HOT','AVAILABLE','NEW','DEGRADED','COOLDOWN')
+                  AND last_seen < ?
+                  AND (last_success=0 OR last_success < ?)
+                """,
+                (stale_cutoff, stale_cutoff),
+            ).rowcount
+            db.execute(
+                """
+                UPDATE servers
+                SET state='RETIRED'
+                WHERE state <> 'RETIRED'
+                  AND last_seen < ?
+                  AND server_key NOT IN (
+                    SELECT server_key FROM endpoints WHERE status NOT IN ('RETIRED')
+                  )
+                """,
+                (retire_cutoff,),
+            )
+            db.execute(
+                """
+                UPDATE servers
+                SET state='STALE'
+                WHERE state NOT IN ('RETIRED','STALE')
+                  AND last_seen < ?
+                  AND server_key NOT IN (
+                    SELECT server_key FROM endpoints WHERE status IN ('HOT','AVAILABLE')
+                  )
+                """,
+                (stale_cutoff,),
+            )
+            db.commit()
+            return {"stale_endpoints": int(stale or 0), "retired_endpoints": int(retired or 0)}
+
     def ranked_hot_pool(
         self,
         limit: int = 10,
         protocols: tuple[str, ...] = ("openvpn", "softether", "sstp", "l2tp-ipsec"),
         per_server_limit: int = 2,
     ) -> list[dict[str, Any]]:
+        self.age_lifecycle()
         protocol_set = {str(p).lower() for p in protocols}
         candidates = [
             ep for ep in self.list_endpoints(limit=1000)
