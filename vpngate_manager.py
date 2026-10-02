@@ -77,6 +77,7 @@ class DualStackHTTPServer(ThreadingHTTPServer):
 
 import vpn_utils
 import proxy_server
+from node_pool import NodePool
 
 def env_int(name: str, default: int, min_value: int | None = None, max_value: int | None = None) -> int:
     raw = os.environ.get(name)
@@ -129,6 +130,8 @@ STATE_FILE = DATA_DIR / "state.json"
 AUTH_FILE = DATA_DIR / "vpngate_auth.txt"
 UPSTREAM_PROXY_AUTH_FILE = DATA_DIR / "upstream_proxy_auth.txt"
 BLACKLIST_FILE = DATA_DIR / "blacklist.json"
+NODE_POOL_DB = DATA_DIR / "node_pool.sqlite3"
+node_pool = NodePool(NODE_POOL_DB)
 
 lock = threading.RLock()
 maintenance_lock = threading.Lock()
@@ -817,6 +820,12 @@ def fetch_candidates() -> list[dict[str, Any]]:
         last_fetch_message=f"Fetched {len(candidates)} unique candidates across multiple attempts.",
         blacklisted_nodes=len(blacklist),
     )
+    try:
+        node_pool.upsert_openvpn_snapshot(candidates, source="official_csv")
+    except Exception as pool_exc:
+        print(f"[NodePool] 官方 CSV 快照写入失败: {pool_exc}", flush=True)
+        log_to_json("WARNING", "Main", f"NodePool 快照写入失败: {pool_exc}")
+
     log_to_json("INFO", "Main", f"成功获取官方 API 节点，共 {len(candidates)} 个候选节点")
     return candidates
 
@@ -1395,6 +1404,10 @@ def test_node_by_id(node_id: str) -> dict[str, Any]:
                 node["ip_type"] = temp_node["ip_type"]
                 node["quality"] = temp_node["quality"]
             
+            try:
+                node_pool.record_probe(node, ok=ok, latency_ms=latency, message=message)
+            except Exception as pool_exc:
+                log_to_json("WARNING", "Main", f"NodePool 单节点探测结果写入失败: {pool_exc}")
             sorted_nodes = sort_all_nodes(nodes)
             write_json(NODES_FILE, sorted_nodes)
             res = next((item for item in sorted_nodes if item.get("id") == node_id), node)
@@ -1488,6 +1501,17 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
             try:
                 res = future.result()
                 updated_nodes_map[nid] = res
+                try:
+                    original_node = next((item for item in to_test if item.get("id") == nid), None)
+                    if original_node:
+                        node_pool.record_probe(
+                            original_node,
+                            ok=res.get("probe_status") == "available",
+                            latency_ms=parse_int(res.get("latency_ms")),
+                            message=str(res.get("probe_message") or ""),
+                        )
+                except Exception as pool_exc:
+                    log_to_json("WARNING", "Main", f"NodePool 批量探测结果写入失败: {pool_exc}")
             except Exception as e:
                 updated_nodes_map[nid] = {
                     "id": nid,
@@ -1664,7 +1688,9 @@ def connect_node(node_id: str) -> str:
         with lock:
             active_openvpn_process = process
             active_openvpn_node_id = node_id
-        
+
+        proxy_server.set_active_interface("tun0")
+        set_state(active_tunnel_protocol="openvpn", active_tunnel_interface="tun0")
         set_state(active_node_latency="配置路由", last_check_message="正在配置策略路由规则与流量转发...")
         setup_policy_routing("tun0")
         
@@ -5222,6 +5248,31 @@ class Handler(BaseHTTPRequestHandler):
                     del stripped["config_text"]
                 stripped_nodes.append(stripped)
             self.send_json({"nodes": stripped_nodes, "state": get_state()})
+        elif effective_path == "/api/node_pool_stats":
+            try:
+                self.send_json({"ok": True, "pool": node_pool.stats()})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+        elif effective_path == "/api/link_probe":
+            # This endpoint is intentionally authenticated. The remote client can
+            # measure RTT from request/response timing; server data reports the
+            # production proxy/tunnel state seen at the same moment.
+            state = get_state()
+            self.send_json({
+                "ok": True,
+                "server_time": time.time(),
+                "proxy_host": LOCAL_PROXY_HOST,
+                "proxy_port": LOCAL_PROXY_PORT,
+                "proxy_ok": bool(state.get("proxy_ok")),
+                "proxy_latency_ms": parse_int(state.get("proxy_latency_ms")),
+                "active_tunnel_protocol": state.get("active_tunnel_protocol", "openvpn"),
+                "active_tunnel_interface": proxy_server.get_active_interface(),
+                "active_node_id": active_openvpn_node_id,
+            })
+        elif effective_path == "/api/link_probe_payload":
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            requested = bounded_int((query.get("bytes") or ["262144"])[0], 262144, 1024, 1048576)
+            self.send_bytes(b"0" * requested, "application/octet-stream")
         elif effective_path.startswith("/configs/"):
             filename = urllib.parse.unquote(effective_path.removeprefix("/configs/"))
             with lock:
