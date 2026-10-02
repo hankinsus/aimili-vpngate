@@ -108,7 +108,7 @@ API_URL = "https://www.vpngate.net/api/iphone/"
 FETCH_INTERVAL_SECONDS = env_int("FETCH_INTERVAL_SECONDS", 1260, 1)
 CHECK_INTERVAL_SECONDS = env_int("CHECK_INTERVAL_SECONDS", 1260, 1)
 TARGET_VALID_NODES = env_int("TARGET_VALID_NODES", 3, 1)
-MAX_SCAN_ROWS = env_int("MAX_SCAN_ROWS", 300, 1)
+MAX_SCAN_ROWS = env_int("MAX_SCAN_ROWS", 5000, 1)
 OPENVPN_TEST_TIMEOUT_SECONDS = env_int("OPENVPN_TEST_TIMEOUT_SECONDS", 35, 1)
 MANUAL_TEST_NODE_LIMIT = env_int("MANUAL_TEST_NODE_LIMIT", 5, 1, 20)
 INITIAL_CONNECT_TEST_LIMIT = env_int("INITIAL_CONNECT_TEST_LIMIT", 10, 1, 50)
@@ -1475,7 +1475,10 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
         return temp_node
 
     updated_nodes_map = {}
-    max_workers = min(5, max(1, len(to_test)))
+    # Protect the production proxy path from CPU/TUN contention while still
+    # refreshing the full candidate pool in the background.
+    probe_worker_limit = 2 if active_openvpn_running() else 5
+    max_workers = min(probe_worker_limit, max(1, len(to_test)))
     completed_since_flush = 0
     last_flush_at = time.time()
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -1759,15 +1762,6 @@ def maintain_valid_nodes(force: bool = False) -> str:
         try:
             set_state(is_connecting=True, last_check_message="正在拉取最新的免费 VPN 节点列表...")
             candidates = fetch_candidates()
-            # Enrich all fetched candidates before expensive OpenVPN probing so
-            # residential/mobile/hosting routing can prioritize the right nodes.
-            # ip-api batch supports many IPs per request and the local cache avoids
-            # repeating lookups on every maintenance cycle.
-            try:
-                vpn_utils.enrich_ip_info(candidates)
-            except Exception as enrich_exc:
-                print(f"[候选节点富化] 批量查询 IP 属性失败，继续执行连通性检测: {enrich_exc}", flush=True)
-                log_to_json("WARNING", "Main", f"候选节点 IP 属性查询失败: {enrich_exc}")
         except Exception as exc:
             vpn_utils.check_and_fix_dns()
             diag_msg = str(exc)
@@ -5019,10 +5013,25 @@ def background_proxy_checker() -> None:
                 )
                 log_to_json("INFO", "Proxy", f"代理可用，IP: {res['ip']}, 延迟: {res['latency_ms']} ms")
             else:
-                error_msg = res.get("error", "未知错误")
+                first_error = res.get("error", "未知错误")
+                # A single public endpoint hiccup must not flap the production
+                # tunnel. Confirm once more before blacklisting or switching.
+                time.sleep(3)
+                confirm = check_proxy_health()
+                if confirm.get("ok"):
+                    set_state(
+                        proxy_ok=True,
+                        proxy_ip=confirm["ip"],
+                        proxy_latency_ms=confirm["latency_ms"],
+                        proxy_error=""
+                    )
+                    log_to_json("WARNING", "Proxy", f"首次健康检查失败但复检恢复，保持当前节点: {first_error}")
+                    continue
+
+                error_msg = confirm.get("error") or first_error
                 if active_openvpn_node_id:
-                    print(f"[警告] {LOCAL_PROXY_PORT} 端口本地代理当前不可用！原因: {error_msg}", flush=True)
-                    log_to_json("WARNING", "Proxy", f"代理不可用: {error_msg}")
+                    print(f"[警告] {LOCAL_PROXY_PORT} 端口本地代理连续检测失败！原因: {error_msg}", flush=True)
+                    log_to_json("WARNING", "Proxy", f"代理连续检测失败: {error_msg}")
                 set_state(
                     proxy_ok=False,
                     proxy_ip="-",
@@ -5030,7 +5039,7 @@ def background_proxy_checker() -> None:
                     proxy_error=error_msg
                 )
 
-                # If we intended to have an active VPN node but proxy failed, trigger auto-switch
+                # Only confirmed failures can trigger production failover.
                 if active_openvpn_node_id:
                     ui_cfg = load_ui_config()
                     routing_mode = ui_cfg.get("routing_mode", "auto")
@@ -5039,12 +5048,12 @@ def background_proxy_checker() -> None:
                             nodes = read_nodes()
                             active_node = next((n for n in nodes if n.get("id") == active_openvpn_node_id), None)
                             if active_node:
-                                mark_blacklisted(active_node, f"代理连通性检测失败: {error_msg}")
+                                mark_blacklisted(active_node, f"代理连续连通性检测失败: {error_msg}")
                                 active_node["probe_status"] = "unavailable"
                                 write_json(NODES_FILE, nodes)
                         auto_switch_node()
                     else:
-                        print(f"[代理守护线程] 固定 IP 模式下代理不可用，正在尝试重启连接同一节点: {active_openvpn_node_id}", flush=True)
+                        print(f"[代理守护线程] 固定 IP 模式下代理连续不可用，正在尝试重启连接同一节点: {active_openvpn_node_id}", flush=True)
                         is_connecting = False
                         try:
                             connect_node(active_openvpn_node_id)
