@@ -8,6 +8,7 @@ import socket
 import threading
 import urllib.parse
 import time
+from pathlib import Path
 from typing import Any
 
 def parse_positive_int(value: str | None, default: int) -> int:
@@ -18,6 +19,30 @@ def parse_positive_int(value: str | None, default: int) -> int:
 
 MAX_PROXY_CONNECTIONS = parse_positive_int(os.environ.get("LOCAL_PROXY_MAX_CONNECTIONS"), 256)
 proxy_connection_sem = threading.BoundedSemaphore(MAX_PROXY_CONNECTIONS)
+
+DATA_DIR = Path(os.environ["VPNGATE_DATA_DIR"]).resolve() if os.environ.get("VPNGATE_DATA_DIR") else Path(__file__).resolve().parent / "vpngate_data"
+ACTIVE_IFACE_FILE = DATA_DIR / "active_iface.txt"
+
+def get_active_interface() -> str:
+    env_iface = str(os.environ.get("ACTIVE_TUNNEL_IFACE") or "").strip()
+    if env_iface:
+        return env_iface
+    try:
+        iface = ACTIVE_IFACE_FILE.read_text(encoding="utf-8").strip()
+        if iface:
+            return iface
+    except OSError:
+        pass
+    return "tun0"
+
+def set_active_interface(iface: str) -> None:
+    iface = str(iface or "").strip()
+    if not iface:
+        return
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = ACTIVE_IFACE_FILE.with_suffix(".tmp")
+    tmp.write_text(iface, encoding="utf-8")
+    tmp.replace(ACTIVE_IFACE_FILE)
 
 def parse_int(value: Any) -> int:
     try:
@@ -84,7 +109,7 @@ def check_credentials(username: str | None, password: str | None) -> bool:
         return True
     return secrets.compare_digest(username or "", expected_user) and secrets.compare_digest(password or "", expected_pass)
 
-def dns_query_over_tun0(host: str, qtype: int, dns_server: str, timeout: float) -> str | None:
+def dns_query_over_active_tunnel(host: str, qtype: int, dns_server: str, timeout: float) -> str | None:
     import random
     sock = None
     try:
@@ -109,12 +134,12 @@ def dns_query_over_tun0(host: str, qtype: int, dns_server: str, timeout: float) 
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.settimeout(timeout)
         try:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, b"tun0")
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, get_active_interface().encode("utf-8"))
         except OSError as e:
             if "operation not permitted" in str(e).lower() or e.errno == 1:
-                print("[DNS 绑定失败] [错误代码 3006] DNS 解析绑定 tun0 权限不足，请确保程序以 root 权限运行！", flush=True)
+                print("[DNS 绑定失败] [错误代码 3006] DNS 解析绑定当前 VPN 网卡 权限不足，请确保程序以 root 权限运行！", flush=True)
             elif "no such device" in str(e).lower() or e.errno == 19:
-                print("[DNS 绑定失败] [错误代码 3004] DNS 解析绑定 tun0 失败，网卡设备不存在，请检查 VPN 连接！", flush=True)
+                print("[DNS 绑定失败] [错误代码 3004] DNS 解析绑定当前 VPN 网卡 失败，当前活动 VPN 网卡不存在，请检查 VPN 连接！", flush=True)
             return None
         sock.sendto(packet, (dns_server, 53))
         resp, _ = sock.recvfrom(4096)
@@ -178,7 +203,7 @@ def dns_query_over_tun0(host: str, qtype: int, dns_server: str, timeout: float) 
         return None
     return None
 
-def resolve_dns_over_tun0(host: str, dns_server: str = "8.8.8.8", timeout: float = 3.0) -> str | None:
+def resolve_dns_over_active_tunnel(host: str, dns_server: str = "8.8.8.8", timeout: float = 3.0) -> str | None:
     try:
         socket.inet_aton(host)
         return host
@@ -189,11 +214,11 @@ def resolve_dns_over_tun0(host: str, dns_server: str = "8.8.8.8", timeout: float
         return host
     except OSError:
         pass
-    return dns_query_over_tun0(host, 1, dns_server, timeout) or dns_query_over_tun0(host, 28, dns_server, timeout)
+    return dns_query_over_active_tunnel(host, 1, dns_server, timeout) or dns_query_over_active_tunnel(host, 28, dns_server, timeout)
 
 def create_connection(address: tuple[str, int], timeout: float = 20) -> socket.socket:
     host, port = address
-    resolved_ip = resolve_dns_over_tun0(host)
+    resolved_ip = resolve_dns_over_active_tunnel(host)
     if resolved_ip:
         host = resolved_ip
 
@@ -204,7 +229,7 @@ def create_connection(address: tuple[str, int], timeout: float = 20) -> socket.s
         try:
             sock = socket.socket(af, socktype, proto)
             sock.settimeout(timeout)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, b"tun0")
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, get_active_interface().encode("utf-8"))
             sock.connect(sa)
             return sock
         except OSError as e:
@@ -212,7 +237,7 @@ def create_connection(address: tuple[str, int], timeout: float = 20) -> socket.s
             if "operation not permitted" in str(e).lower() or e.errno == 1:
                 err = OSError(f"[错误代码 3006] [ERR_PROXY_BIND_TUN_PERM_DENIED] 绑定虚拟网卡 tun0 失败，权限不足！必须以 root 权限运行，或者进程缺少 CAP_NET_RAW 权限。")
             elif "no such device" in str(e).lower() or e.errno == 19:
-                err = OSError(f"[错误代码 3004] [ERR_ROUTE_DEV_NOT_FOUND] 绑定虚拟网卡 tun0 失败，找不到设备！这通常是因为 OpenVPN 核心未能成功连接或已被异常终止。")
+                err = OSError(f"[错误代码 3004] [ERR_ROUTE_DEV_NOT_FOUND] 绑定虚拟网卡 tun0 失败，找不到当前活动 VPN 网卡！这通常是因为 VPN 隧道未成功建立或已异常退出。")
             if sock is not None:
                 sock.close()
     if err is not None:
