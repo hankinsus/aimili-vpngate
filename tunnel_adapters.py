@@ -414,10 +414,14 @@ cleanup() {{
     echo "d vpngate" > "{control_file}"
   fi
   ipsec down vpngate >/dev/null 2>&1 || true
-  kill "$XL2TP_PID" >/dev/null 2>&1 || true
-  kill "$STARTER_PID" >/dev/null 2>&1 || true
-  wait "$XL2TP_PID" >/dev/null 2>&1 || true
-  wait "$STARTER_PID" >/dev/null 2>&1 || true
+  if [ -n "${XL2TP_PID:-}" ]; then
+    kill "$XL2TP_PID" >/dev/null 2>&1 || true
+    wait "$XL2TP_PID" >/dev/null 2>&1 || true
+  fi
+  if [ -n "${STARTER_PID:-}" ]; then
+    kill "$STARTER_PID" >/dev/null 2>&1 || true
+    wait "$STARTER_PID" >/dev/null 2>&1 || true
+  fi
 }}
 trap cleanup EXIT INT TERM
 
