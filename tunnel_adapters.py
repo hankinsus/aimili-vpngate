@@ -118,6 +118,10 @@ class SoftEtherAdapter:
             iface = wait_for_new_interface(before, ("vpn_",), timeout=12)
             if not iface:
                 iface = f"vpn_{nic}"
+            try:
+                subprocess.run(["ip", "addr", "flush", "dev", iface], capture_output=True, timeout=3)
+            except Exception:
+                pass
             if not obtain_dhcp(iface):
                 self.disconnect(account)
                 return TunnelResult(False, self.protocol, interface=iface, message="SoftEther connected but DHCP/IP assignment failed")
@@ -125,13 +129,23 @@ class SoftEtherAdapter:
         except Exception as exc:
             return TunnelResult(False, self.protocol, message=str(exc))
 
-    def disconnect(self, account: str = "aimili") -> None:
+    def disconnect(self, account: str = "aimili", nic: str | None = None, delete: bool = False) -> None:
         if not self.available():
             return
         try:
             self._vpncmd("AccountDisconnect", account, timeout=6)
         except Exception:
             pass
+        if delete:
+            try:
+                self._vpncmd("AccountDelete", account, timeout=6)
+            except Exception:
+                pass
+            if nic:
+                try:
+                    self._vpncmd("NicDelete", nic, timeout=6)
+                except Exception:
+                    pass
 
 class SSTPAdapter:
     protocol = "sstp"
