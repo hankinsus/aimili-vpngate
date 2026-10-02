@@ -1815,7 +1815,7 @@ def connect_node(node_id: str) -> str:
             write_json(auth_file, ui_cfg)
         
         set_state(active_node_latency="清理连接", last_check_message="正在关闭与清理旧的 VPN 连接及网卡...")
-        stop_active_openvpn()
+        stop_all_tunnels()
         stopped_existing = True
 
         set_state(active_node_latency="写入配置", last_check_message="正在写入 OpenVPN 节点配置文件...")
@@ -5941,7 +5941,7 @@ class Handler(BaseHTTPRequestHandler):
                     DATA_DIR.mkdir(exist_ok=True, parents=True)
                     write_json(auth_file, ui_cfg)
                 
-                stop_active_openvpn()
+                stop_all_tunnels()
                 with lock:
                     nodes = read_nodes()
                     for item in nodes:
