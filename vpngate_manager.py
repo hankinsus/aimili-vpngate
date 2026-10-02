@@ -113,6 +113,7 @@ MAX_SCAN_ROWS = env_int("MAX_SCAN_ROWS", 5000, 1)
 OPENVPN_TEST_TIMEOUT_SECONDS = env_int("OPENVPN_TEST_TIMEOUT_SECONDS", 35, 1)
 MANUAL_TEST_NODE_LIMIT = env_int("MANUAL_TEST_NODE_LIMIT", 5, 1, 20)
 INITIAL_CONNECT_TEST_LIMIT = env_int("INITIAL_CONNECT_TEST_LIMIT", 10, 1, 50)
+BACKGROUND_PROBE_BATCH = env_int("BACKGROUND_PROBE_BATCH", 40, 5, 200)
 OPENVPN_CMD = os.environ.get("OPENVPN_CMD", "openvpn")
 OPENVPN_AUTH_USER = os.environ.get("OPENVPN_AUTH_USER", "vpn")
 OPENVPN_AUTH_PASS = os.environ.get("OPENVPN_AUTH_PASS", "vpn")
@@ -1919,9 +1920,15 @@ def maintain_valid_nodes(force: bool = False) -> str:
                 n for n in current_nodes
                 if not n.get("active") and n.get("id") not in initial_tested_ids
             ]
+            # Never sweep a large pool in one burst. Probe the stalest entries
+            # first and rotate through the pool across maintenance cycles.
+            to_test.sort(key=lambda n: float(n.get("probed_at", 0) or 0))
+            total_due = len(to_test)
+            batch_limit = BACKGROUND_PROBE_BATCH if active_openvpn_running() else max(BACKGROUND_PROBE_BATCH, INITIAL_CONNECT_TEST_LIMIT * 2)
+            to_test = to_test[:batch_limit]
             to_test_ids = [n["id"] for n in to_test]
             
-        msg = f"开始对列表中所有候选节点进行周期连通性与延迟测试，待检测节点共 {len(to_test_ids)} 个"
+        msg = f"开始低频轮询候选节点，本轮检测 {len(to_test_ids)}/{total_due} 个（优先最久未检测），避免影响生产代理"
         print(f"[周期检测] {msg}", flush=True)
         log_to_json("INFO", "Main", msg)
         
