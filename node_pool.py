@@ -90,6 +90,133 @@ class NodePool:
         raw = f"{server_key}|{protocol}|{transport}|{port}".encode("utf-8")
         return hashlib.sha256(raw).hexdigest()[:32]
 
+    def upsert_discovery_snapshot(self, servers: list[dict[str, Any]], source: str = "official_html") -> None:
+        now = time.time()
+        seen_keys: set[str] = set()
+        with self.lock, closing(self._connect()) as db:
+            for server in servers:
+                hostname = str(server.get("hostname") or server.get("host_name") or "").strip().lower()
+                ip = str(server.get("ip") or "").strip()
+                key = hostname or ip
+                if not key:
+                    continue
+                seen_keys.add(key)
+                country = str(server.get("country") or "").strip()
+                metadata = {
+                    "source": source,
+                    "ping": int(server.get("ping") or 0),
+                    "speed": int(server.get("speed") or 0),
+                    "sessions": int(server.get("sessions") or 0),
+                    "score": int(server.get("score") or 0),
+                }
+                db.execute(
+                    """
+                    INSERT INTO servers(server_key, hostname, current_ip, country, first_seen, last_seen, last_source, missing_count, state, metadata_json)
+                    VALUES(?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(server_key) DO UPDATE SET
+                      hostname=CASE WHEN excluded.hostname<>'' THEN excluded.hostname ELSE servers.hostname END,
+                      current_ip=CASE WHEN excluded.current_ip<>'' THEN excluded.current_ip ELSE servers.current_ip END,
+                      country=CASE WHEN excluded.country<>'' THEN excluded.country ELSE servers.country END,
+                      last_seen=excluded.last_seen,
+                      last_source=excluded.last_source,
+                      missing_count=0,
+                      state=CASE WHEN servers.state='RETIRED' THEN 'NEW' ELSE servers.state END,
+                      metadata_json=excluded.metadata_json
+                    """,
+                    (key, hostname, ip, country, now, now, source, 0, "NEW", json.dumps(metadata, ensure_ascii=False)),
+                )
+
+                for endpoint in server.get("protocols") or []:
+                    protocol = str(endpoint.get("protocol") or "").strip().lower()
+                    transport = str(endpoint.get("transport") or "unknown").strip().lower()
+                    try:
+                        port = int(endpoint.get("port") or 0)
+                    except (TypeError, ValueError):
+                        port = 0
+                    if not protocol:
+                        continue
+                    eid = self.endpoint_id(key, protocol, transport, port)
+                    endpoint_meta = {
+                        "hostname": str(endpoint.get("hostname") or hostname or "").strip().lower(),
+                        "ip": ip,
+                        "source": source,
+                    }
+                    db.execute(
+                        """
+                        INSERT INTO endpoints(endpoint_id, server_key, protocol, transport, port, status, first_seen, last_seen, metadata_json)
+                        VALUES(?,?,?,?,?,?,?,?,?)
+                        ON CONFLICT(endpoint_id) DO UPDATE SET
+                          last_seen=excluded.last_seen,
+                          metadata_json=excluded.metadata_json,
+                          status=CASE WHEN endpoints.status='RETIRED' THEN 'NEW' ELSE endpoints.status END
+                        """,
+                        (eid, key, protocol, transport, port, "NEW", now, now, json.dumps(endpoint_meta, ensure_ascii=False)),
+                    )
+
+                db.execute(
+                    "INSERT INTO observations(server_key, source, seen_at, ip, ping, speed, sessions, score) VALUES(?,?,?,?,?,?,?,?)",
+                    (
+                        key, source, now, ip,
+                        int(server.get("ping") or 0), int(server.get("speed") or 0),
+                        int(server.get("sessions") or 0), int(server.get("score") or 0),
+                    ),
+                )
+
+            # The HTML list is explicitly partial, so absence in this snapshot
+            # must not aggressively age every historical server. Only endpoints
+            # that remain unseen for long periods are naturally deprioritized by
+            # next_test / last_seen scheduling.
+            db.commit()
+
+    def list_endpoints(self, protocol: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+        limit = max(1, min(int(limit), 1000))
+        with self.lock, closing(self._connect()) as db:
+            params: list[Any] = []
+            where = ""
+            if protocol:
+                where = "WHERE e.protocol=?"
+                params.append(str(protocol).lower())
+            params.append(limit)
+            rows = db.execute(
+                f"""
+                SELECT e.*, s.hostname, s.current_ip, s.country, s.state AS server_state,
+                       s.metadata_json AS server_metadata_json
+                FROM endpoints e
+                JOIN servers s ON s.server_key=e.server_key
+                {where}
+                ORDER BY
+                  CASE e.status
+                    WHEN 'HOT' THEN 0
+                    WHEN 'AVAILABLE' THEN 1
+                    WHEN 'NEW' THEN 2
+                    WHEN 'DEGRADED' THEN 3
+                    WHEN 'COOLDOWN' THEN 4
+                    WHEN 'STALE' THEN 5
+                    ELSE 6
+                  END,
+                  e.next_test ASC,
+                  e.latency_ewma ASC,
+                  e.last_seen DESC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+            result: list[dict[str, Any]] = []
+            for row in rows:
+                item = dict(row)
+                try:
+                    item["metadata"] = json.loads(item.pop("metadata_json") or "{}")
+                except Exception:
+                    item["metadata"] = {}
+                    item.pop("metadata_json", None)
+                try:
+                    item["server_metadata"] = json.loads(item.pop("server_metadata_json") or "{}")
+                except Exception:
+                    item["server_metadata"] = {}
+                    item.pop("server_metadata_json", None)
+                result.append(item)
+            return result
+
     def upsert_openvpn_snapshot(self, nodes: list[dict[str, Any]], source: str = "official_csv") -> None:
         now = time.time()
         seen_keys: set[str] = set()
