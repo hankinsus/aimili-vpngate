@@ -16,7 +16,7 @@ jobs:
       - name: Validate Ubuntu multi-protocol package names
         run: |
           sudo apt-get update -qq
-          apt-cache show softether-vpnclient softether-vpncmd strongswan strongswan-starter xl2tpd sstp-client ppp >/dev/null
+          apt-cache show softether-vpnclient softether-vpncmd strongswan strongswan-starter xl2tpd sstp-client ppp busybox >/dev/null
       - name: Compile Python sources
         run: |
           python3 -m py_compile vpngate_manager.py proxy_server.py vpn_utils.py node_pool.py tunnel_adapters.py vpngate_discovery.py
