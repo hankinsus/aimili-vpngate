@@ -2175,7 +2175,7 @@ def probe_pool_endpoint(endpoint_id: str) -> dict[str, Any]:
         egress = (
             tunnel_adapters.L2TPIPsecAdapter.egress_check(result)
             if protocol == "l2tp-ipsec"
-            else check_interface_egress(result.interface)
+            else check_interface_egress(result.interface, result.gateway)
         )
         if not egress.get("ok"):
             message = str(egress.get("error") or "接口出口不可用")
