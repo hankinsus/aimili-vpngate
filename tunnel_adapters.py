@@ -65,14 +65,14 @@ def interface_has_ipv4(iface: str) -> bool:
     except Exception:
         return False
 
-def obtain_dhcp_lease(iface: str, timeout: int = 15) -> tuple[bool, str]:
+def obtain_dhcp_lease(iface: str, timeout: int = 15) -> tuple[bool, str, str]:
     """Acquire a DHCP lease without installing a system default route.
 
     The DHCP hook configures only the interface address/link and records the
     offered gateway. Policy routing is added later by the tunnel manager.
     """
     if not iface:
-        return False, ""
+        return False, "", "missing interface"
 
     work_dir = Path(tempfile.mkdtemp(prefix="aimili-dhcp-"))
     lease_file = work_dir / "lease.json"
@@ -132,20 +132,41 @@ pathlib.Path("/PLACEHOLDER").write_text(
     if command_exists("dhclient"):
         commands.append(["dhclient", "-1", "-v", "-sf", str(hook), iface])
 
+    debug_lines: list[str] = []
     try:
         for cmd in commands:
             try:
-                subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-            except Exception:
+                res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+                debug_lines.append(
+                    f"cmd={' '.join(cmd[:3])} rc={res.returncode} "
+                    f"stdout={(res.stdout or '').strip()[-500:]} "
+                    f"stderr={(res.stderr or '').strip()[-500:]}"
+                )
+            except Exception as exc:
+                debug_lines.append(f"cmd={' '.join(cmd[:3])} exception={exc}")
                 continue
             if lease_file.exists() and interface_has_ipv4(iface):
                 try:
                     import json
                     lease = json.loads(lease_file.read_text(encoding="utf-8"))
-                    return True, str(lease.get("gateway") or "")
-                except Exception:
-                    return True, ""
-        return interface_has_ipv4(iface), ""
+                    return True, str(lease.get("gateway") or ""), " | ".join(debug_lines)
+                except Exception as exc:
+                    return True, "", " | ".join(debug_lines + [f"lease_parse={exc}"])
+
+        try:
+            link = subprocess.run(
+                ["ip", "-d", "link", "show", "dev", iface],
+                capture_output=True, text=True, timeout=3,
+            )
+            debug_lines.append(f"link={(link.stdout or link.stderr).strip()[-800:]}")
+            addr = subprocess.run(
+                ["ip", "-4", "addr", "show", "dev", iface],
+                capture_output=True, text=True, timeout=3,
+            )
+            debug_lines.append(f"addr={(addr.stdout or addr.stderr).strip()[-500:]}")
+        except Exception as exc:
+            debug_lines.append(f"iface_debug={exc}")
+        return interface_has_ipv4(iface), "", " | ".join(debug_lines)
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
 
@@ -206,13 +227,23 @@ class SoftEtherAdapter:
                 subprocess.run(["ip", "link", "set", iface, "up"], capture_output=True, timeout=3)
             except Exception:
                 pass
-            dhcp_ok, gateway = obtain_dhcp_lease(iface)
+            dhcp_ok, gateway, dhcp_debug = obtain_dhcp_lease(iface)
             if not dhcp_ok:
                 self.disconnect(account)
-                return TunnelResult(False, self.protocol, interface=iface, message="SoftEther connected but DHCP/IP assignment failed")
+                return TunnelResult(
+                    False,
+                    self.protocol,
+                    interface=iface,
+                    message=f"SoftEther connected but DHCP/IP assignment failed: {dhcp_debug[-1800:]}",
+                )
             if not gateway:
                 self.disconnect(account)
-                return TunnelResult(False, self.protocol, interface=iface, message="SoftEther DHCP lease did not provide a gateway")
+                return TunnelResult(
+                    False,
+                    self.protocol,
+                    interface=iface,
+                    message=f"SoftEther DHCP lease did not provide a gateway: {dhcp_debug[-1200:]}",
+                )
             return TunnelResult(
                 True,
                 self.protocol,
