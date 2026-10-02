@@ -453,15 +453,15 @@ class NodePool:
                   AND e.next_test <= ?
                   AND e.status NOT IN ('RETIRED')
                 ORDER BY
+                  e.next_test ASC,
                   CASE e.status
-                    WHEN 'HOT' THEN 0
-                    WHEN 'AVAILABLE' THEN 1
-                    WHEN 'NEW' THEN 2
+                    WHEN 'NEW' THEN 0
+                    WHEN 'HOT' THEN 1
+                    WHEN 'AVAILABLE' THEN 2
                     WHEN 'DEGRADED' THEN 3
                     WHEN 'COOLDOWN' THEN 4
                     ELSE 5
                   END,
-                  e.last_success DESC,
                   e.last_seen DESC
                 LIMIT ?
                 """,
