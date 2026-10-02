@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import sqlite3
 import threading
 import time
@@ -180,7 +181,11 @@ class NodePool:
             rows = db.execute(
                 f"""
                 SELECT e.*, s.hostname, s.current_ip, s.country, s.state AS server_state,
-                       s.metadata_json AS server_metadata_json
+                       s.metadata_json AS server_metadata_json,
+                       COALESCE((SELECT o.ping FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1), 0) AS latest_ping,
+                       COALESCE((SELECT o.speed FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1), 0) AS latest_speed,
+                       COALESCE((SELECT o.sessions FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1), 0) AS latest_sessions,
+                       COALESCE((SELECT o.score FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1), 0) AS latest_server_score
                 FROM endpoints e
                 JOIN servers s ON s.server_key=e.server_key
                 {where}
@@ -360,12 +365,113 @@ class NodePool:
                 db.execute("UPDATE servers SET state=? WHERE server_key=?", (status, key))
             db.commit()
 
+    @staticmethod
+    def _selection_score(endpoint: dict[str, Any], now: float | None = None) -> tuple[float, dict[str, float]]:
+        now = time.time() if now is None else now
+        status = str(endpoint.get("status") or "")
+        success = max(0, int(endpoint.get("success_count") or 0))
+        failure = max(0, int(endpoint.get("failure_count") or 0))
+        total = success + failure
+        reliability = (success + 3.0) / (total + 4.0)
+        success_streak = max(0, int(endpoint.get("success_streak") or 0))
+        fail_streak = max(0, int(endpoint.get("fail_streak") or 0))
+        latency = float(endpoint.get("latency_ewma") or 0)
+        jitter = float(endpoint.get("jitter_ewma") or 0)
+        last_success = float(endpoint.get("last_success") or 0)
+        age = max(0.0, now - last_success) if last_success > 0 else 86400.0
+
+        speed_bps = max(0, int(endpoint.get("latest_speed") or 0))
+        speed_mbps = speed_bps / 1_000_000.0
+        sessions = max(0, int(endpoint.get("latest_sessions") or 0))
+        server_score = max(0, int(endpoint.get("latest_server_score") or 0))
+
+        status_bonus = 500.0 if status == "HOT" else 350.0 if status == "AVAILABLE" else 0.0
+        reliability_bonus = reliability * 650.0
+        streak_bonus = min(success_streak, 10) * 22.0
+        freshness_bonus = max(0.0, 80.0 - age / 60.0)
+        speed_bonus = min(100.0, math.log10(max(1.0, speed_mbps)) * 35.0) if speed_mbps > 0 else 0.0
+        server_score_bonus = min(60.0, math.log10(max(1.0, float(server_score))) * 12.0) if server_score > 0 else 0.0
+
+        latency_penalty = min(900.0, latency if latency > 0 else 700.0) * 0.75
+        jitter_penalty = min(400.0, jitter) * 1.5
+        fail_penalty = fail_streak * 140.0
+        load_penalty = min(250, sessions) * 0.45
+
+        final = (
+            status_bonus
+            + reliability_bonus
+            + streak_bonus
+            + freshness_bonus
+            + speed_bonus
+            + server_score_bonus
+            - latency_penalty
+            - jitter_penalty
+            - fail_penalty
+            - load_penalty
+        )
+        details = {
+            "status_bonus": round(status_bonus, 2),
+            "reliability": round(reliability, 4),
+            "reliability_bonus": round(reliability_bonus, 2),
+            "streak_bonus": round(streak_bonus, 2),
+            "freshness_bonus": round(freshness_bonus, 2),
+            "speed_bonus": round(speed_bonus, 2),
+            "server_score_bonus": round(server_score_bonus, 2),
+            "latency_penalty": round(latency_penalty, 2),
+            "jitter_penalty": round(jitter_penalty, 2),
+            "fail_penalty": round(fail_penalty, 2),
+            "load_penalty": round(load_penalty, 2),
+        }
+        return final, details
+
+    def ranked_hot_pool(
+        self,
+        limit: int = 10,
+        protocols: tuple[str, ...] = ("openvpn", "softether", "sstp", "l2tp-ipsec"),
+        per_server_limit: int = 2,
+    ) -> list[dict[str, Any]]:
+        protocol_set = {str(p).lower() for p in protocols}
+        candidates = [
+            ep for ep in self.list_endpoints(limit=1000)
+            if str(ep.get("protocol") or "").lower() in protocol_set
+            and ep.get("status") in ("HOT", "AVAILABLE")
+        ]
+        now = time.time()
+        for endpoint in candidates:
+            score, details = self._selection_score(endpoint, now)
+            endpoint["selection_score"] = round(score, 2)
+            endpoint["score_details"] = details
+        candidates.sort(
+            key=lambda ep: (
+                -float(ep.get("selection_score") or -999999),
+                float(ep.get("latency_ewma") or 999999),
+                float(ep.get("jitter_ewma") or 999999),
+                -float(ep.get("last_success") or 0),
+            )
+        )
+
+        selected: list[dict[str, Any]] = []
+        per_server: dict[str, int] = {}
+        for endpoint in candidates:
+            key = str(endpoint.get("server_key") or "")
+            if per_server.get(key, 0) >= max(1, int(per_server_limit)):
+                continue
+            selected.append(endpoint)
+            per_server[key] = per_server.get(key, 0) + 1
+            if len(selected) >= max(1, min(int(limit), 50)):
+                break
+        return selected
+
     def get_endpoint(self, endpoint_id: str) -> dict[str, Any] | None:
         with self.lock, closing(self._connect()) as db:
             row = db.execute(
                 """
                 SELECT e.*, s.hostname, s.current_ip, s.country, s.state AS server_state,
-                       s.metadata_json AS server_metadata_json
+                       s.metadata_json AS server_metadata_json,
+                       COALESCE((SELECT o.ping FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1), 0) AS latest_ping,
+                       COALESCE((SELECT o.speed FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1), 0) AS latest_speed,
+                       COALESCE((SELECT o.sessions FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1), 0) AS latest_sessions,
+                       COALESCE((SELECT o.score FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1), 0) AS latest_server_score
                 FROM endpoints e
                 JOIN servers s ON s.server_key=e.server_key
                 WHERE e.endpoint_id=?
