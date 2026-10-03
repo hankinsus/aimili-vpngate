@@ -1037,16 +1037,29 @@ exit 42
         return report
 
     @staticmethod
-    def egress_check(result: TunnelResult, timeout: int = 7) -> dict[str, Any]:
+    def egress_check(result: TunnelResult, timeout: int = 9) -> dict[str, Any]:
         if not result.namespace or not result.inner_interface:
             return {"ok": False, "error": "L2TP namespace/interface missing"}
+
+        # Resolve outside the isolated namespace. Ubuntu commonly exposes
+        # systemd-resolved on 127.0.0.53, which is not reachable from a fresh netns.
+        try:
+            infos = socket.getaddrinfo("api.ipify.org", 443, socket.AF_INET, socket.SOCK_STREAM)
+            if not infos:
+                return {"ok": False, "error": "Unable to resolve api.ipify.org on root namespace"}
+            api_ip = str(infos[0][4][0])
+        except Exception as exc:
+            return {"ok": False, "error": f"Root DNS lookup failed: {exc}"}
+
         cmd = [
             "ip", "netns", "exec", result.namespace,
-            "curl", "-s",
+            "curl", "-4", "-sS",
             "--interface", f"if!{result.inner_interface}",
+            "--resolve", f"api.ipify.org:443:{api_ip}",
             "-w", "\\n%{time_total} %{http_code}",
-            "http://api.ipify.org",
-            "--max-time", "6",
+            "https://api.ipify.org",
+            "--connect-timeout", "4",
+            "--max-time", "8",
         ]
         try:
             res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
