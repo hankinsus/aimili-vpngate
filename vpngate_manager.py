@@ -6507,8 +6507,13 @@ class Handler(BaseHTTPRequestHandler):
                 set_state(
                     active_openvpn_node_id="",
                     active_pool_endpoint_id="",
+                    active_pool_endpoint=None,
                     active_tunnel_protocol="",
                     active_tunnel_interface="",
+                    proxy_ok=False,
+                    proxy_ip="-",
+                    proxy_latency_ms=0,
+                    proxy_error="",
                     last_check_message="手动断开连接",
                     active_node_latency="无活动连接",
                 )
