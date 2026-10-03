@@ -148,6 +148,11 @@ def main() -> int:
     parser.add_argument("--failures", type=int, default=2)
     parser.add_argument("--wait-timeout", type=int, default=45)
     parser.add_argument("--sample-interval", type=float, default=1.0)
+    parser.add_argument(
+        "--require-different-protocol",
+        action="store_true",
+        help="要求故障切换必须跨协议；默认只要求切换到不同端点并恢复业务",
+    )
     args = parser.parse_args()
 
     data_dir = Path(args.data_dir)
@@ -225,7 +230,7 @@ def main() -> int:
             recovered = wait_for_active(
                 state_path,
                 args.wait_timeout,
-                protocol_not=from_protocol,
+                protocol_not=from_protocol if args.require_different_protocol else "",
                 endpoint_not=from_endpoint,
             )
             recovered_at = time.time()
@@ -237,6 +242,14 @@ def main() -> int:
                 "to_endpoint": recovered.get("active_pool_endpoint_id"),
                 "to_ip": recovered.get("proxy_ip"),
                 "to_latency_ms": recovered.get("proxy_latency_ms"),
+                "same_protocol_fallback": (
+                    bool(from_protocol)
+                    and recovered.get("active_tunnel_protocol") == from_protocol
+                ),
+                "cross_protocol_fallback": (
+                    bool(from_protocol)
+                    and recovered.get("active_tunnel_protocol") != from_protocol
+                ),
                 "wall_recovery_seconds": round(recovered_at - event_at, 2),
                 "manager_failover_duration_ms": recovered.get("last_failover_duration_ms"),
                 "manager_failover_ok": recovered.get("last_failover_ok"),
