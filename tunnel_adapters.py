@@ -676,6 +676,21 @@ class L2TPIPsecAdapter:
         ppp_log = work_dir / "ppp.log"
         helper = work_dir / "run-l2tp.sh"
 
+        def collect_l2tp_logs(prefix: str = "") -> str:
+            parts: list[str] = [prefix] if prefix else []
+            for label, log_path in (
+                ("ipsec", ipsec_log),
+                ("xl2tpd", xl2tp_log),
+                ("ppp", ppp_log),
+            ):
+                try:
+                    if log_path.exists():
+                        text = log_path.read_text(encoding="utf-8", errors="replace")
+                        parts.append(f"--- {label} ---\n{text[-5000:]}")
+                except Exception as exc:
+                    parts.append(f"--- {label} read error: {exc} ---")
+            return "\n".join(part for part in parts if part)[-12000:]
+
         ipsec_conf.write_text(
             f"""config setup
     uniqueids=no
@@ -845,9 +860,10 @@ exit 42
                         output = (proc.stdout.read() if proc.stdout else "")[-2000:]
                     except Exception:
                         pass
+                    diagnostic = collect_l2tp_logs(output or "L2TP helper exited before PPP became ready")
                     self.disconnect(namespace)
                     shutil.rmtree(work_dir, ignore_errors=True)
-                    return TunnelResult(False, self.protocol, message=output or "L2TP helper exited before PPP became ready")
+                    return TunnelResult(False, self.protocol, message=diagnostic)
                 if ready.exists() and iface_file.exists():
                     inner_iface = iface_file.read_text(encoding="utf-8").strip()
                     result = TunnelResult(
@@ -906,24 +922,12 @@ exit 42
             except Exception as exc:
                 timeout_output = f"log_capture_error={exc}"
 
-            log_parts = [timeout_output]
-            for label, log_path in (
-                ("ipsec", ipsec_log),
-                ("xl2tpd", xl2tp_log),
-                ("ppp", ppp_log),
-            ):
-                try:
-                    if log_path.exists():
-                        text = log_path.read_text(encoding="utf-8", errors="replace")
-                        log_parts.append(f"--- {label} ---\n{text[-5000:]}")
-                except Exception as exc:
-                    log_parts.append(f"--- {label} read error: {exc} ---")
-            combined_logs = "\n".join(part for part in log_parts if part)
+            combined_logs = collect_l2tp_logs(timeout_output)
             shutil.rmtree(work_dir, ignore_errors=True)
             return TunnelResult(
                 False,
                 self.protocol,
-                message=f"L2TP/IPsec connection timed out after {timeout}s. {combined_logs[-12000:]}",
+                message=f"L2TP/IPsec connection timed out after {timeout}s. {combined_logs}",
             )
         except Exception as exc:
             self._cleanup_iptables(subnet, physical)
