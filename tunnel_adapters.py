@@ -443,6 +443,8 @@ class SSTPAdapter:
         if not self.available():
             return TunnelResult(False, self.protocol, message="sstpc/pppd not installed")
         before = list_interfaces()
+        routes_before = snapshot_main_routes()
+        connected_successfully = False
         # VPNGate requires the DDNS hostname for SSTP/TLS identity. Do not
         # silently replace it with the current IP address.
         if not hostname or "." not in hostname:
@@ -480,7 +482,15 @@ class SSTPAdapter:
             ip_deadline = time.time() + max(4.0, min(float(timeout), 15.0))
             while time.time() < ip_deadline:
                 if interface_has_ipv4(iface):
-                    return TunnelResult(True, self.protocol, interface=iface, message="SSTP connected", process=proc)
+                    connected_successfully = True
+                    return TunnelResult(
+                        True,
+                        self.protocol,
+                        interface=iface,
+                        message="SSTP connected",
+                        process=proc,
+                        details={"added_host_routes": added_cleanup_host_routes(routes_before)},
+                    )
                 if proc.poll() is not None:
                     output = ""
                     try:
@@ -515,16 +525,22 @@ class SSTPAdapter:
             )
         except Exception as exc:
             return TunnelResult(False, self.protocol, message=str(exc))
+        finally:
+            if not connected_successfully:
+                cleanup_route_lines(added_cleanup_host_routes(routes_before))
 
     @staticmethod
-    def disconnect(process: subprocess.Popen[str] | None) -> None:
-        if process is None or process.poll() is not None:
-            return
-        process.terminate()
-        try:
-            process.wait(timeout=6)
-        except subprocess.TimeoutExpired:
-            process.kill()
+    def disconnect(
+        process: subprocess.Popen[str] | None,
+        added_routes: list[str] | tuple[str, ...] | set[str] | None = None,
+    ) -> None:
+        if process is not None and process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=6)
+            except subprocess.TimeoutExpired:
+                process.kill()
+        cleanup_route_lines(added_routes)
 
 class L2TPIPsecAdapter:
     protocol = "l2tp-ipsec"
