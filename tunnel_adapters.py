@@ -65,6 +65,50 @@ def interface_has_ipv4(iface: str) -> bool:
     except Exception:
         return False
 
+def snapshot_main_routes() -> set[str]:
+    try:
+        res = subprocess.run(
+            ["ip", "-4", "route", "show", "table", "main"],
+            capture_output=True, text=True, timeout=3,
+        )
+        return {line.strip() for line in res.stdout.splitlines() if line.strip()}
+    except Exception:
+        return set()
+
+def _is_cleanup_host_route(line: str) -> bool:
+    parts = str(line or "").split()
+    if not parts or parts[0] == "default":
+        return False
+    target = parts[0]
+    try:
+        network = ipaddress.ip_network(target if "/" in target else target + "/32", strict=False)
+    except ValueError:
+        return False
+    if network.version != 4 or network.prefixlen != 32:
+        return False
+    # Never remove routes owned by a VPN interface itself. We only clean the
+    # physical-interface host routes SoftEther may add to preserve server reachability.
+    joined = " ".join(parts)
+    if any(marker in joined for marker in (" dev vpn_", " dev tun", " dev ppp", " dev alh", " dev aln")):
+        return False
+    return True
+
+def added_cleanup_host_routes(before: set[str]) -> list[str]:
+    current = snapshot_main_routes()
+    return sorted(line for line in current - before if _is_cleanup_host_route(line))
+
+def cleanup_route_lines(routes: list[str] | tuple[str, ...] | set[str] | None) -> None:
+    for line in routes or []:
+        if not _is_cleanup_host_route(str(line)):
+            continue
+        try:
+            subprocess.run(
+                ["ip", "route", "del", *str(line).split()],
+                capture_output=True, text=True, timeout=3,
+            )
+        except Exception:
+            pass
+
 def obtain_dhcp_lease(iface: str, timeout: int = 15) -> tuple[bool, str, str]:
     """Acquire a DHCP lease without installing a system default route.
 
@@ -182,6 +226,55 @@ class SoftEtherAdapter:
         cmd = ["vpncmd", "localhost", "/CLIENT", "/CMD", *args]
         return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
 
+    def _client_ready(self) -> bool:
+        try:
+            result = self._vpncmd("AccountList", timeout=5)
+            return result.returncode == 0
+        except Exception:
+            return False
+
+    def _ensure_client_service(self) -> tuple[bool, str]:
+        if self._client_ready():
+            return True, "reused existing SoftEther VPN Client"
+
+        debug: list[str] = []
+        if command_exists("systemctl"):
+            try:
+                result = subprocess.run(
+                    ["systemctl", "start", "softether-vpnclient"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                debug.append(
+                    f"systemctl rc={result.returncode} "
+                    f"out={(result.stdout or '').strip()[-300:]} "
+                    f"err={(result.stderr or '').strip()[-500:]}"
+                )
+                for _ in range(10):
+                    if self._client_ready():
+                        return True, " | ".join(debug)
+                    time.sleep(0.5)
+            except Exception as exc:
+                debug.append(f"systemctl exception={exc}")
+
+        try:
+            result = subprocess.run(
+                ["vpnclient", "start"],
+                capture_output=True, text=True, timeout=8,
+            )
+            debug.append(
+                f"vpnclient start rc={result.returncode} "
+                f"out={(result.stdout or '').strip()[-300:]} "
+                f"err={(result.stderr or '').strip()[-500:]}"
+            )
+            for _ in range(10):
+                if self._client_ready():
+                    return True, " | ".join(debug)
+                time.sleep(0.5)
+        except Exception as exc:
+            debug.append(f"vpnclient start exception={exc}")
+
+        return False, " | ".join(debug)
+
     def _wait_account_connected(self, account: str, timeout: float = 15.0) -> tuple[bool, str]:
         deadline = time.time() + timeout
         last_output = ""
@@ -207,6 +300,8 @@ class SoftEtherAdapter:
         if not self.available():
             return TunnelResult(False, self.protocol, message="vpnclient/vpncmd not installed")
         before = list_interfaces()
+        routes_before = snapshot_main_routes()
+        connected_successfully = False
         try:
             # Ubuntu/Debian package normally gets /run/softether from systemd's
             # RuntimeDirectory=. When we intentionally keep the global service
@@ -216,7 +311,13 @@ class SoftEtherAdapter:
                 Path("/run/softether").chmod(0o755)
             except OSError:
                 pass
-            subprocess.run(["vpnclient", "start"], capture_output=True, text=True, timeout=8)
+            service_ok, service_debug = self._ensure_client_service()
+            if not service_ok:
+                return TunnelResult(
+                    False,
+                    self.protocol,
+                    message=f"SoftEther VPN Client service unavailable: {service_debug[-1600:]}",
+                )
             # Idempotent cleanup. These commands may fail when entries do not exist.
             self._vpncmd("AccountDisconnect", account, timeout=5)
             self._vpncmd("AccountDelete", account, timeout=5)
@@ -281,19 +382,39 @@ class SoftEtherAdapter:
                     interface=iface,
                     message=f"SoftEther DHCP lease did not provide a gateway: {dhcp_debug[-1200:]}",
                 )
+            added_routes = added_cleanup_host_routes(routes_before)
+            connected_successfully = True
             return TunnelResult(
                 True,
                 self.protocol,
                 interface=iface,
                 gateway=gateway,
                 message="SoftEther connected",
-                details={"account": account, "nic": nic},
+                details={
+                    "account": account,
+                    "nic": nic,
+                    "added_host_routes": added_routes,
+                },
             )
         except Exception as exc:
             return TunnelResult(False, self.protocol, message=str(exc))
+        finally:
+            if not connected_successfully:
+                try:
+                    self.disconnect(account, nic=nic, delete=True)
+                except Exception:
+                    pass
+                cleanup_route_lines(added_cleanup_host_routes(routes_before))
 
-    def disconnect(self, account: str = "aimili", nic: str | None = None, delete: bool = False) -> None:
+    def disconnect(
+        self,
+        account: str = "aimili",
+        nic: str | None = None,
+        delete: bool = False,
+        added_routes: list[str] | tuple[str, ...] | set[str] | None = None,
+    ) -> None:
         if not self.available():
+            cleanup_route_lines(added_routes)
             return
         try:
             self._vpncmd("AccountDisconnect", account, timeout=6)
@@ -309,6 +430,7 @@ class SoftEtherAdapter:
                     self._vpncmd("NicDelete", nic, timeout=6)
                 except Exception:
                     pass
+        cleanup_route_lines(added_routes)
 
 class SSTPAdapter:
     protocol = "sstp"
