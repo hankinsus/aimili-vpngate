@@ -734,7 +734,7 @@ ipcp-accept-remote
 usepeerdns
 mtu 1360
 mru 1360
-persist 0
+nopersist
 maxfail 1
 debug
 logfile {ppp_log}
