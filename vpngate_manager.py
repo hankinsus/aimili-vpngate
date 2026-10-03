@@ -443,7 +443,13 @@ def clear_active_connection_state(message: str) -> None:
     if active_external_tunnel is not None:
         try:
             if active_external_tunnel.protocol == "softether":
-                tunnel_adapters.SoftEtherAdapter().disconnect()
+                details = active_external_tunnel.details or {}
+                tunnel_adapters.SoftEtherAdapter().disconnect(
+                    account=str(details.get("account") or "aimili"),
+                    nic=str(details.get("nic") or "aimili"),
+                    delete=True,
+                    added_routes=details.get("added_host_routes") or [],
+                )
             elif active_external_tunnel.protocol == "sstp":
                 tunnel_adapters.SSTPAdapter.disconnect(active_external_tunnel.process)
         except Exception:
@@ -1250,6 +1256,7 @@ def stop_active_external_tunnel() -> None:
                 account=str(details.get("account") or "aimili"),
                 nic=str(details.get("nic") or "aimili"),
                 delete=True,
+                added_routes=details.get("added_host_routes") or [],
             )
         elif tunnel.protocol == "sstp":
             tunnel_adapters.SSTPAdapter.disconnect(tunnel.process)
@@ -1333,6 +1340,7 @@ def connect_pool_endpoint(endpoint_id: str) -> str:
                     account=str(details.get("account") or f"prod{token}"),
                     nic=str(details.get("nic") or f"a{token}"),
                     delete=True,
+                    added_routes=details.get("added_host_routes") or [],
                 )
             elif result.protocol == "sstp":
                 tunnel_adapters.SSTPAdapter.disconnect(result.process)
@@ -2147,7 +2155,12 @@ def probe_pool_endpoint(endpoint_id: str) -> dict[str, Any]:
                 username="vpn",
                 password="vpn",
             )
-            cleanup = lambda: adapter.disconnect(account=account, nic=nic, delete=True)
+            cleanup = lambda: adapter.disconnect(
+                account=account,
+                nic=nic,
+                delete=True,
+                added_routes=((result.details or {}).get("added_host_routes") if result else []),
+            )
         elif protocol == "sstp":
             adapter = tunnel_adapters.SSTPAdapter()
             target = host if port in (0, 443) else f"{host}:{port}"
