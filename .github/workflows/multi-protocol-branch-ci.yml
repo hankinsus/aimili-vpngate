@@ -159,6 +159,85 @@ jobs:
           print(protocols)
           PY
 
+      - name: Client link HTTP integration smoke test
+        run: |
+          set -e
+          export VPNGATE_DATA_DIR="$RUNNER_TEMP/aimili-sidecar"
+          export LOCAL_PROXY_HOST=127.0.0.1
+          export LOCAL_PROXY_PORT=27928
+          export UI_HOST=127.0.0.1
+          export UI_PORT=28787
+          export ACTIVE_ROUTE_TABLE=220
+          export ISOLATED_INSTANCE=1
+          export DISABLE_BACKGROUND_LOOPS=1
+          python3 -u vpngate_manager.py >"$RUNNER_TEMP/aimili-sidecar.log" 2>&1 &
+          PID=$!
+          trap 'kill "$PID" >/dev/null 2>&1 || true' EXIT
+          for _ in $(seq 1 50); do
+            if python3 - <<'PY'
+          import socket,sys
+          s=socket.socket()
+          s.settimeout(0.2)
+          try:
+              s.connect(("127.0.0.1",28787))
+          except Exception:
+              sys.exit(1)
+          finally:
+              s.close()
+          PY
+            then break; fi
+            sleep 0.2
+          done
+          python3 - <<'PY'
+          import http.cookiejar
+          import json
+          import os
+          import urllib.request
+
+          data_dir=os.environ["VPNGATE_DATA_DIR"]
+          cfg=json.load(open(os.path.join(data_dir,"ui_auth.json"),encoding="utf-8"))
+          base=f"http://127.0.0.1:{cfg['port']}/{cfg['secret_path']}"
+          jar=http.cookiejar.CookieJar()
+          op=urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+
+          payload=json.dumps({"username":cfg["username"],"password":cfg["password"]}).encode()
+          req=urllib.request.Request(base+"/api/login",data=payload,headers={"Content-Type":"application/json"},method="POST")
+          with op.open(req,timeout=5) as r:
+              assert json.load(r)["ok"] is True
+
+          with op.open(base+"/link-test",timeout=5) as r:
+              body=r.read()
+              assert r.status==200 and b"17928" not in body
+              assert b"link_probe_upload" in body
+
+          with op.open(base+"/api/link_probe",timeout=5) as r:
+              probe=json.load(r)
+              assert probe["ok"] is True
+              assert probe["proxy_port"]==27928
+              assert probe["proxy_port_reachable"] is True
+
+          with op.open(base+"/api/link_probe_payload?bytes=65536",timeout=5) as r:
+              body=r.read()
+              assert len(body)==65536
+
+          upload=b"0"*32768
+          req=urllib.request.Request(
+              base+"/api/link_probe_upload",
+              data=upload,
+              headers={"Content-Type":"application/octet-stream"},
+              method="POST",
+          )
+          with op.open(req,timeout=5) as r:
+              result=json.load(r)
+              assert result["ok"] is True
+              assert result["received_bytes"]==32768
+
+          print("client link HTTP integration OK")
+          PY
+          kill "$PID"
+          wait "$PID" || true
+          trap - EXIT
+
   ubuntu-runtime-prereqs:
     runs-on: ubuntu-24.04
     steps:
