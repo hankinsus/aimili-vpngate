@@ -5787,18 +5787,25 @@ def background_proxy_checker() -> None:
                 continue
 
             # Never infer ownership from an existing host tun/ppp interface.
-            # In sidecar/isolation scenarios another manager may own tun0.
+            # If this manager has no intended active endpoint, it is idle.
+            # If an endpoint ID still exists but the process/interface vanished,
+            # that is a real tunnel failure and must enter failover handling.
             if not active_tunnel_running():
-                set_state(
-                    proxy_ok=False,
-                    proxy_ip="-",
-                    proxy_latency_ms=0,
-                    proxy_error="当前实例没有活动 VPN 隧道",
-                )
-                time.sleep(PROXY_HEALTH_INTERVAL_SECONDS)
-                continue
-
-            res = check_proxy_health()
+                if not active_pool_endpoint_id and not active_openvpn_node_id:
+                    set_state(
+                        proxy_ok=False,
+                        proxy_ip="-",
+                        proxy_latency_ms=0,
+                        proxy_error="当前实例没有活动 VPN 隧道",
+                    )
+                    time.sleep(PROXY_HEALTH_INTERVAL_SECONDS)
+                    continue
+                res = {
+                    "ok": False,
+                    "error": "活动 VPN 隧道进程或网卡已消失",
+                }
+            else:
+                res = check_proxy_health()
             if res["ok"]:
                 set_state(
                     proxy_ok=True,
