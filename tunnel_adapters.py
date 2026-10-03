@@ -799,6 +799,10 @@ echo "c vpngate" > "{control_file}"
 for _ in $(seq 1 60); do
   IFACE=$(ip -o link show | awk -F': ' '$2 ~ /^ppp[0-9]+$/ {{print $2; exit}}')
   if [ -n "$IFACE" ] && ip -4 -o addr show dev "$IFACE" | grep -q ' inet '; then
+    # Preserve the outer IPsec/L2TP transport path before moving the default
+    # route into PPP. Without this host route, packets to the VPN server itself
+    # can recurse into ppp0 and collapse the tunnel.
+    ip route replace "{resolved_host}/32" via "{host_ip}" dev "{ns_veth}" onlink
     ip route replace default dev "$IFACE"
     sysctl -w net.ipv4.ip_forward=1 >/dev/null
     iptables -t nat -C POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null || \
