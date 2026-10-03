@@ -6086,6 +6086,12 @@ class Handler(BaseHTTPRequestHandler):
                 
         if effective_path in ("/", "/index.html"):
             self.send_bytes(INDEX_HTML.encode("utf-8"), "text/html; charset=utf-8")
+        elif effective_path == "/link-test":
+            try:
+                link_test_path = ROOT_DIR / "client_link_test.html"
+                self.send_bytes(link_test_path.read_bytes(), "text/html; charset=utf-8")
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         elif effective_path == "/api/nodes":
             global last_active_ping_time, last_active_latency, active_openvpn_node_id
             nodes = read_nodes()
@@ -6166,6 +6172,12 @@ class Handler(BaseHTTPRequestHandler):
                 "active_node_id": active_openvpn_node_id,
                 "active_pool_endpoint_id": active_pool_endpoint_id,
                 "pool": node_pool.stats(),
+                "hot_pool_size": state.get("hot_pool_size", 0),
+                "hot_pool_target": state.get("hot_pool_target", HOT_POOL_TARGET),
+                "last_failover_ok": state.get("last_failover_ok"),
+                "last_failover_duration_ms": state.get("last_failover_duration_ms", 0),
+                "last_failover_from_protocol": state.get("last_failover_from_protocol", ""),
+                "last_failover_to_protocol": state.get("last_failover_to_protocol", ""),
             })
         elif effective_path == "/api/link_probe_payload":
             query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
@@ -6729,6 +6741,31 @@ class Handler(BaseHTTPRequestHandler):
                     "l2tp_ipsec": l2tp,
                     "protocols": tunnel_adapters.capability_report(),
                 }, HTTPStatus.OK if l2tp.get("ready") else HTTPStatus.SERVICE_UNAVAILABLE)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+        elif effective_path == "/api/link_probe_upload":
+            try:
+                requested = parse_int(self.headers.get("Content-Length"))
+                if requested <= 0 or requested > LINK_PROBE_MAX_BYTES:
+                    self.send_json(
+                        {"ok": False, "error": f"上传测速大小必须在 1 到 {LINK_PROBE_MAX_BYTES} 字节之间"},
+                        HTTPStatus.BAD_REQUEST,
+                    )
+                    return
+                client_ip = str(self.client_address[0] if self.client_address else "unknown")
+                allowed, retry_after = reserve_link_probe_bytes(client_ip, requested)
+                if not allowed:
+                    self.send_json(
+                        {"ok": False, "error": "测速请求过于频繁", "retry_after_seconds": retry_after},
+                        HTTPStatus.TOO_MANY_REQUESTS,
+                    )
+                    return
+                body = self.read_request_body(LINK_PROBE_MAX_BYTES)
+                self.send_json({
+                    "ok": True,
+                    "received_bytes": len(body),
+                    "server_time": time.time(),
+                })
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         elif effective_path == "/api/refresh_protocol_catalog":
