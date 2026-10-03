@@ -141,6 +141,10 @@ UI_PORT = env_int("UI_PORT", 8787, 1, 65535)
 ACTIVE_ROUTE_TABLE = env_int("ACTIVE_ROUTE_TABLE", 100, 1, 252)
 ISOLATED_INSTANCE = env_flag("ISOLATED_INSTANCE", False)
 DISABLE_BACKGROUND_LOOPS = env_flag("DISABLE_BACKGROUND_LOOPS", False)
+ENABLE_COLLECTOR_LOOP = env_flag("ENABLE_COLLECTOR_LOOP", not DISABLE_BACKGROUND_LOOPS)
+ENABLE_PROXY_HEALTH_LOOP = env_flag("ENABLE_PROXY_HEALTH_LOOP", not DISABLE_BACKGROUND_LOOPS)
+ENABLE_PINGER_LOOP = env_flag("ENABLE_PINGER_LOOP", not DISABLE_BACKGROUND_LOOPS)
+ENABLE_PROTOCOL_PROBE_LOOP = env_flag("ENABLE_PROTOCOL_PROBE_LOOP", not DISABLE_BACKGROUND_LOOPS)
 INVALID_BACKOFF_SECONDS = env_int("INVALID_BACKOFF_SECONDS", 30 * 60, 1)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
@@ -6572,6 +6576,55 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": True})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+        elif effective_path == "/api/simulate_tunnel_failure":
+            try:
+                self.read_request_body()
+                if not ISOLATED_INSTANCE:
+                    self.send_json(
+                        {"ok": False, "error": "该测试接口仅允许隔离实例使用"},
+                        HTTPStatus.FORBIDDEN,
+                    )
+                    return
+
+                protocol = ""
+                endpoint_id = ""
+                if active_external_tunnel is not None:
+                    protocol = str(active_external_tunnel.protocol or "")
+                    endpoint_id = str(active_pool_endpoint_id or "")
+                    if protocol == "softether":
+                        details = active_external_tunnel.details or {}
+                        tunnel_adapters.SoftEtherAdapter().disconnect(
+                            account=str(details.get("account") or "aimili"),
+                            nic=str(details.get("nic") or "aimili"),
+                            delete=False,
+                        )
+                    elif protocol == "sstp":
+                        tunnel_adapters.SSTPAdapter.disconnect(active_external_tunnel.process)
+                    elif protocol == "l2tp-ipsec":
+                        l2tp_adapter.disconnect(active_external_tunnel.namespace)
+                    else:
+                        raise RuntimeError(f"不支持模拟故障的协议: {protocol}")
+                elif active_openvpn_running():
+                    protocol = "openvpn"
+                    endpoint_id = str(active_openvpn_node_id or "")
+                    stop_process(active_openvpn_process)
+                else:
+                    self.send_json({"ok": False, "error": "当前没有活动隧道"}, HTTPStatus.CONFLICT)
+                    return
+
+                set_state(
+                    simulated_failure_at=time.time(),
+                    simulated_failure_protocol=protocol,
+                    simulated_failure_endpoint=endpoint_id,
+                )
+                self.send_json({
+                    "ok": True,
+                    "protocol": protocol,
+                    "endpoint_id": endpoint_id,
+                    "message": "已模拟底层隧道故障，等待健康守护自动切换",
+                })
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         elif effective_path == "/api/protocol_selftest":
             try:
                 self.read_request_body()
@@ -6707,6 +6760,10 @@ def main() -> None:
             "blacklisted_nodes": 0,
             "isolated_instance": ISOLATED_INSTANCE,
             "background_loops_disabled": DISABLE_BACKGROUND_LOOPS,
+            "collector_loop_enabled": ENABLE_COLLECTOR_LOOP,
+            "proxy_health_loop_enabled": ENABLE_PROXY_HEALTH_LOOP,
+            "pinger_loop_enabled": ENABLE_PINGER_LOOP,
+            "protocol_probe_loop_enabled": ENABLE_PROTOCOL_PROBE_LOOP,
             "active_route_table": ACTIVE_ROUTE_TABLE,
             "proxy_health_interval_seconds": PROXY_HEALTH_INTERVAL_SECONDS,
             "proxy_health_confirm_delay_seconds": PROXY_HEALTH_CONFIRM_DELAY_SECONDS,
@@ -6760,13 +6817,21 @@ def main() -> None:
     else:
         print("[警告] 代理网关启动超时，继续执行脚本...", flush=True)
 
-    if DISABLE_BACKGROUND_LOOPS:
-        print("[隔离实例] 后台节点同步/健康检查/协议探测循环已禁用，仅响应手动 API 操作。", flush=True)
-    else:
+    enabled_loops: list[str] = []
+    if ENABLE_COLLECTOR_LOOP:
         threading.Thread(target=collector_loop, daemon=True).start()
+        enabled_loops.append("collector")
+    if ENABLE_PROXY_HEALTH_LOOP:
         threading.Thread(target=background_proxy_checker, daemon=True).start()
+        enabled_loops.append("proxy-health")
+    if ENABLE_PINGER_LOOP:
         threading.Thread(target=active_node_pinger, daemon=True).start()
+        enabled_loops.append("pinger")
+    if ENABLE_PROTOCOL_PROBE_LOOP:
         threading.Thread(target=protocol_probe_loop, daemon=True).start()
+        enabled_loops.append("protocol-probe")
+    if ISOLATED_INSTANCE:
+        print(f"[隔离实例] 已启用后台循环: {', '.join(enabled_loops) if enabled_loops else '无'}", flush=True)
     
     ui_cfg = load_ui_config()
     ui_host = ui_cfg.get("host", UI_HOST)
