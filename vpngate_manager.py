@@ -125,6 +125,8 @@ BACKGROUND_PROBE_BATCH = env_int("BACKGROUND_PROBE_BATCH", 20, 5, 100)
 ACTIVE_BACKGROUND_PROBE_BATCH = env_int("ACTIVE_BACKGROUND_PROBE_BATCH", 3, 1, 20)
 PROTOCOL_PROBE_BATCH = env_int("PROTOCOL_PROBE_BATCH", 3, 1, 10)
 PROTOCOL_PROBE_INTERVAL_SECONDS = env_int("PROTOCOL_PROBE_INTERVAL_SECONDS", 600, 120, 3600)
+PROXY_HEALTH_INTERVAL_SECONDS = env_int("PROXY_HEALTH_INTERVAL_SECONDS", 15, 5, 120)
+PROXY_HEALTH_CONFIRM_DELAY_SECONDS = env_int("PROXY_HEALTH_CONFIRM_DELAY_SECONDS", 2, 1, 10)
 HOT_POOL_TARGET = env_int("HOT_POOL_TARGET", 8, 5, 10)
 LINK_PROBE_MAX_BYTES = env_int("LINK_PROBE_MAX_BYTES", 1048576, 65536, 4194304)
 LINK_PROBE_WINDOW_BYTES = env_int("LINK_PROBE_WINDOW_BYTES", 4194304, 262144, 16777216)
@@ -2329,26 +2331,72 @@ def endpoint_allowed_by_pool_routing(endpoint: dict[str, Any], ui_cfg: dict[str,
     return True
 
 def try_unified_failover(exclude_endpoint_id: str = "", attempts: int = 4) -> bool:
+    started = time.time()
+    from_protocol = ""
+    from_endpoint = ""
+    if active_external_tunnel is not None:
+        from_protocol = str(active_external_tunnel.protocol or "")
+        from_endpoint = str(active_pool_endpoint_id or "")
+    elif active_openvpn_running():
+        from_protocol = "openvpn"
+        from_endpoint = str(active_openvpn_node_id or "")
+
     ui_cfg = load_ui_config()
     hot_pool = [
         ep for ep in node_pool.ranked_hot_pool(limit=12, per_server_limit=2)
         if ep.get("endpoint_id") != exclude_endpoint_id
         and endpoint_allowed_by_pool_routing(ep, ui_cfg)
     ]
+    set_state(
+        failover_in_progress=True,
+        failover_started_at=started,
+        failover_from_protocol=from_protocol,
+        failover_from_endpoint=from_endpoint,
+        failover_candidate_count=len(hot_pool),
+    )
+    last_error = ""
     for endpoint in hot_pool[:max(1, attempts)]:
         try:
             connect_ranked_endpoint(endpoint)
+            duration_ms = int((time.time() - started) * 1000)
             set_state(
                 hot_pool_size=len(hot_pool),
                 hot_pool_selected_score=endpoint.get("selection_score", 0),
+                failover_in_progress=False,
+                last_failover_ok=True,
+                last_failover_at=time.time(),
+                last_failover_duration_ms=duration_ms,
+                last_failover_from_protocol=from_protocol,
+                last_failover_from_endpoint=from_endpoint,
+                last_failover_to_protocol=str(endpoint.get("protocol") or ""),
+                last_failover_to_endpoint=str(endpoint.get("endpoint_id") or ""),
+                last_failover_error="",
+            )
+            log_to_json(
+                "INFO",
+                "VPN",
+                f"统一 Hot Pool 切换成功 {from_protocol or '-'} -> {endpoint.get('protocol')}，耗时 {duration_ms} ms",
             )
             return True
         except Exception as exc:
+            last_error = str(exc)
             log_to_json(
                 "WARNING",
                 "VPN",
                 f"统一 Hot Pool 切换失败 {endpoint.get('protocol')} {endpoint.get('endpoint_id')}: {exc}",
             )
+    duration_ms = int((time.time() - started) * 1000)
+    set_state(
+        failover_in_progress=False,
+        last_failover_ok=False,
+        last_failover_at=time.time(),
+        last_failover_duration_ms=duration_ms,
+        last_failover_from_protocol=from_protocol,
+        last_failover_from_endpoint=from_endpoint,
+        last_failover_to_protocol="",
+        last_failover_to_endpoint="",
+        last_failover_error=last_error or "无可用 Hot Pool 候选",
+    )
     return False
 
 def maintain_valid_nodes(force: bool = False) -> str:
@@ -5726,7 +5774,7 @@ def check_proxy_health() -> dict[str, Any]:
 
 def background_proxy_checker() -> None:
     global last_checker_heartbeat, is_connecting
-    time.sleep(30)
+    time.sleep(PROXY_HEALTH_INTERVAL_SECONDS)
     while True:
         last_checker_heartbeat = time.time()
         try:
@@ -5747,7 +5795,7 @@ def background_proxy_checker() -> None:
                 first_error = res.get("error", "未知错误")
                 # A single public endpoint hiccup must not flap the production
                 # tunnel. Confirm once more before blacklisting or switching.
-                time.sleep(3)
+                time.sleep(PROXY_HEALTH_CONFIRM_DELAY_SECONDS)
                 confirm = check_proxy_health()
                 if confirm.get("ok"):
                     set_state(
@@ -5777,8 +5825,12 @@ def background_proxy_checker() -> None:
                         node_pool.record_endpoint_probe(failed_endpoint, False, 0, error_msg)
                     except Exception:
                         pass
-                    stop_active_external_tunnel()
+                    # Preserve the failed-but-still-present tunnel until a new
+                    # candidate is independently verified. connect_pool_endpoint()
+                    # will release the old tunnel only after the new one passes
+                    # direct egress validation (true make-before-break).
                     if not try_unified_failover(exclude_endpoint_id=failed_endpoint, attempts=3):
+                        stop_active_external_tunnel()
                         auto_switch_node()
                 elif active_openvpn_node_id:
                     ui_cfg = load_ui_config()
@@ -5809,7 +5861,7 @@ def background_proxy_checker() -> None:
         except Exception as e:
             print(f"[错误] 代理后台检测发生异常: {e}", flush=True)
             log_to_json("ERROR", "Proxy", f"检测守护线程发生异常: {e}")
-        time.sleep(30)
+        time.sleep(PROXY_HEALTH_INTERVAL_SECONDS)
 
 def active_node_pinger() -> None:
     global last_pinger_heartbeat
@@ -6656,6 +6708,11 @@ def main() -> None:
             "isolated_instance": ISOLATED_INSTANCE,
             "background_loops_disabled": DISABLE_BACKGROUND_LOOPS,
             "active_route_table": ACTIVE_ROUTE_TABLE,
+            "proxy_health_interval_seconds": PROXY_HEALTH_INTERVAL_SECONDS,
+            "proxy_health_confirm_delay_seconds": PROXY_HEALTH_CONFIRM_DELAY_SECONDS,
+            "failover_in_progress": False,
+            "last_failover_ok": None,
+            "last_failover_duration_ms": 0,
         },
     )
     threading.Thread(target=proxy_server.start_proxy_server, args=(LOCAL_PROXY_HOST, LOCAL_PROXY_PORT), daemon=True).start()
