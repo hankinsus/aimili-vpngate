@@ -671,6 +671,9 @@ class L2TPIPsecAdapter:
         ppp_options = work_dir / "ppp-options"
         control_file = work_dir / "l2tp-control"
         pid_file = work_dir / "xl2tpd.pid"
+        ipsec_log = work_dir / "ipsec.log"
+        xl2tp_log = work_dir / "xl2tpd.log"
+        ppp_log = work_dir / "ppp.log"
         helper = work_dir / "run-l2tp.sh"
 
         ipsec_conf.write_text(
@@ -718,6 +721,8 @@ mtu 1360
 mru 1360
 persist 0
 maxfail 1
+debug
+logfile {ppp_log}
 """,
             encoding="utf-8",
         )
@@ -765,11 +770,11 @@ cleanup() {{
 }}
 trap cleanup EXIT INT TERM
 
-ipsec start --nofork --conf "{ipsec_conf}" &
+ipsec start --nofork --conf "{ipsec_conf}" >"{ipsec_log}" 2>&1 &
 STARTER_PID=$!
 sleep 2
-timeout 15s ipsec up vpngate
-xl2tpd -D -c "{xl2tp_conf}" -s "{l2tp_secrets}" -p "{pid_file}" -C "{control_file}" &
+timeout 15s ipsec up vpngate >>"{ipsec_log}" 2>&1
+xl2tpd -D -c "{xl2tp_conf}" -s "{l2tp_secrets}" -p "{pid_file}" -C "{control_file}" >"{xl2tp_log}" 2>&1 &
 XL2TP_PID=$!
 for _ in $(seq 1 20); do
   [ -e "{control_file}" ] && break
@@ -901,11 +906,24 @@ exit 42
             except Exception as exc:
                 timeout_output = f"log_capture_error={exc}"
 
+            log_parts = [timeout_output]
+            for label, log_path in (
+                ("ipsec", ipsec_log),
+                ("xl2tpd", xl2tp_log),
+                ("ppp", ppp_log),
+            ):
+                try:
+                    if log_path.exists():
+                        text = log_path.read_text(encoding="utf-8", errors="replace")
+                        log_parts.append(f"--- {label} ---\n{text[-5000:]}")
+                except Exception as exc:
+                    log_parts.append(f"--- {label} read error: {exc} ---")
+            combined_logs = "\n".join(part for part in log_parts if part)
             shutil.rmtree(work_dir, ignore_errors=True)
             return TunnelResult(
                 False,
                 self.protocol,
-                message=f"L2TP/IPsec connection timed out after {timeout}s. {timeout_output}",
+                message=f"L2TP/IPsec connection timed out after {timeout}s. {combined_logs[-12000:]}",
             )
         except Exception as exc:
             self._cleanup_iptables(subnet, physical)
