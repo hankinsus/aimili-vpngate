@@ -668,6 +668,20 @@ class NodePool:
         fetch_limit = min(1000, max(50, requested_limit * 8))
         params: list[Any] = [*wanted, now, fetch_limit]
         with self.lock, closing(self._connect()) as db:
+            # Protocol-deficit scheduling prevents one protocol (usually the
+            # largest source, e.g. SoftEther) from monopolizing the warmup queue.
+            counts = {
+                protocol: int(
+                    db.execute(
+                        "SELECT COUNT(*) FROM endpoints WHERE protocol=? AND status IN ('HOT','AVAILABLE')",
+                        (protocol,),
+                    ).fetchone()[0]
+                    or 0
+                )
+                for protocol in wanted
+            }
+            deficit = {protocol: 1.0 / max(1, counts[protocol]) for protocol in wanted}
+
             rows = db.execute(
                 f"""
                 SELECT e.endpoint_id
@@ -677,6 +691,13 @@ class NodePool:
                   AND e.next_test <= ?
                   AND e.status NOT IN ('RETIRED')
                 ORDER BY
+                  CASE e.protocol
+                    {" ".join(
+                        f"WHEN '{protocol}' THEN {deficit[protocol]:.12f}"
+                        for protocol in wanted
+                    )}
+                    ELSE 0
+                  END DESC,
                   e.next_test ASC,
                   CASE e.status
                     WHEN 'NEW' THEN 0
