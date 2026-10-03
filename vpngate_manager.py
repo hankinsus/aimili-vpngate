@@ -410,7 +410,7 @@ def get_state() -> dict[str, Any]:
                 }
         except Exception:
             pass
-    state["active_tunnel_interface"] = proxy_server.get_active_interface()
+    state["active_tunnel_interface"] = proxy_server.get_active_interface() if active_tunnel_running() else ""
     if active_external_tunnel is not None:
         state["active_tunnel_protocol"] = active_external_tunnel.protocol
     elif active_openvpn_running():
@@ -5784,6 +5784,18 @@ def background_proxy_checker() -> None:
         try:
             if is_connecting:
                 time.sleep(5)
+                continue
+
+            # Never infer ownership from an existing host tun/ppp interface.
+            # In sidecar/isolation scenarios another manager may own tun0.
+            if not active_tunnel_running():
+                set_state(
+                    proxy_ok=False,
+                    proxy_ip="-",
+                    proxy_latency_ms=0,
+                    proxy_error="当前实例没有活动 VPN 隧道",
+                )
+                time.sleep(PROXY_HEALTH_INTERVAL_SECONDS)
                 continue
 
             res = check_proxy_health()
