@@ -687,6 +687,8 @@ conn vpngate
     rightprotoport=17/1701
     rightid=%any
     forceencaps=yes
+    ike=aes256-sha1-modp1024,aes128-sha1-modp1024,3des-sha1-modp1024!
+    esp=aes256-sha1,aes128-sha1,3des-sha1!
     keyingtries=1
     dpdaction=clear
     dpddelay=20s
@@ -751,7 +753,7 @@ cleanup() {{
   if [ -S "{control_file}" ] || [ -e "{control_file}" ]; then
     echo "d vpngate" > "{control_file}"
   fi
-  ipsec down vpngate >/dev/null 2>&1 || true
+  timeout 3s ipsec down vpngate >/dev/null 2>&1 || true
   if [ -n "${{XL2TP_PID:-}}" ]; then
     kill "$XL2TP_PID" >/dev/null 2>&1 || true
     wait "$XL2TP_PID" >/dev/null 2>&1 || true
@@ -766,7 +768,7 @@ trap cleanup EXIT INT TERM
 ipsec start --nofork --conf "{ipsec_conf}" &
 STARTER_PID=$!
 sleep 2
-ipsec up vpngate
+timeout 15s ipsec up vpngate
 xl2tpd -D -c "{xl2tp_conf}" -s "{l2tp_secrets}" -p "{pid_file}" -C "{control_file}" &
 XL2TP_PID=$!
 for _ in $(seq 1 20); do
@@ -864,15 +866,41 @@ exit 42
                 if proc.poll() is None:
                     proc.terminate()
                     try:
-                        proc.wait(timeout=5)
+                        proc.wait(timeout=3)
                     except subprocess.TimeoutExpired:
                         proc.kill()
-                        proc.wait(timeout=3)
+                        try:
+                            proc.wait(timeout=2)
+                        except subprocess.TimeoutExpired:
+                            pass
+            except Exception:
+                pass
+
+            # Kill namespace descendants BEFORE reading the helper pipe.
+            # charon/stroke inherit stdout and otherwise keep the pipe open forever.
+            self.disconnect(namespace)
+
+            try:
                 if proc.stdout:
-                    timeout_output = (proc.stdout.read() or "")[-3000:]
+                    import select
+                    chunks: list[str] = []
+                    deadline_logs = time.time() + 2.0
+                    while time.time() < deadline_logs:
+                        ready_fds, _, _ = select.select([proc.stdout], [], [], 0.2)
+                        if not ready_fds:
+                            if proc.poll() is not None:
+                                break
+                            continue
+                        chunk = proc.stdout.read(3000)
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+                        if sum(len(x) for x in chunks) >= 6000:
+                            break
+                    timeout_output = "".join(chunks)[-4000:]
             except Exception as exc:
                 timeout_output = f"log_capture_error={exc}"
-            self.disconnect(namespace)
+
             shutil.rmtree(work_dir, ignore_errors=True)
             return TunnelResult(
                 False,
@@ -916,6 +944,16 @@ exit 42
                     os.kill(int(pid), 15)
                 except Exception:
                     pass
+            if pids:
+                time.sleep(0.5)
+            remaining = self._run(["ip", "netns", "pids", namespace], timeout=3).stdout.split()
+            for pid in remaining:
+                try:
+                    os.kill(int(pid), 9)
+                except Exception:
+                    pass
+            if remaining:
+                time.sleep(0.2)
         except Exception:
             pass
 
