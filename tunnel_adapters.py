@@ -275,24 +275,32 @@ class SoftEtherAdapter:
 
         return False, " | ".join(debug)
 
+    @staticmethod
+    def _status_is_connected(output: str) -> bool:
+        normalized = " ".join(str(output or "").lower().split())
+        connected_markers = (
+            "connection completed",
+            "session established",
+            "connection status | connected",
+            "connection status|connected",
+        )
+        return any(marker in normalized for marker in connected_markers)
+
+    def account_connected(self, account: str) -> tuple[bool, str]:
+        try:
+            status = self._vpncmd("AccountStatusGet", account, timeout=4)
+            output = (status.stdout or "") + (status.stderr or "")
+            return status.returncode == 0 and self._status_is_connected(output), output
+        except Exception as exc:
+            return False, str(exc)
+
     def _wait_account_connected(self, account: str, timeout: float = 15.0) -> tuple[bool, str]:
         deadline = time.time() + timeout
         last_output = ""
         while time.time() < deadline:
-            try:
-                status = self._vpncmd("AccountStatusGet", account, timeout=5)
-                last_output = (status.stdout or "") + (status.stderr or "")
-                normalized = " ".join(last_output.lower().split())
-                connected_markers = (
-                    "connection completed",
-                    "session established",
-                    "connection status | connected",
-                    "connection status|connected",
-                )
-                if any(marker in normalized for marker in connected_markers):
-                    return True, last_output
-            except Exception as exc:
-                last_output = str(exc)
+            ok, last_output = self.account_connected(account)
+            if ok:
+                return True, last_output
             time.sleep(1)
         return False, last_output
 
