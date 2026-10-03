@@ -62,7 +62,12 @@ if [ "$PKG_MGR" = "apt-get" ]; then
     echo -e "  -> 正在运行 apt-get update 更新软件源清单..."
     apt-get update -q || true
     echo -e "  -> 正在运行 apt-get install 安装基础依赖包..."
-    apt-get install -y openvpn curl git ca-certificates iptables iproute2 psmisc python3
+    apt-get install -y openvpn curl git ca-certificates iptables iproute2 psmisc python3 ppp
+    if [ "$OS_TYPE" = "ubuntu" ]; then
+        echo -e "  -> 安装 Ubuntu 多协议 VPN 依赖（SoftEther / L2TP-IPsec / SSTP）..."
+        apt-get install -y softether-vpnclient softether-vpncmd strongswan strongswan-starter xl2tpd sstp-client busybox || \
+          echo -e "${YELLOW}  -> 部分多协议组件未安装成功；OpenVPN 主链路仍可继续，安装日志请检查软件源支持情况。${PLAIN}"
+    fi
 elif [ "$PKG_MGR" = "apk" ]; then
     echo -e "  -> 正在运行 apk update 更新软件源清单..."
     apk update || true

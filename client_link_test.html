@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AimiliVPN 客户端链路测试</title>
+<style>
+body{font-family:system-ui,-apple-system,sans-serif;background:#0f172a;color:#e2e8f0;margin:0;padding:24px}
+.wrap{max-width:820px;margin:auto}.card{background:#111827;border:1px solid #334155;border-radius:14px;padding:20px;margin:14px 0}
+h1{font-size:24px}button{background:#2563eb;color:white;border:0;border-radius:9px;padding:11px 18px;font-size:15px;cursor:pointer}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}.metric{background:#0b1220;border-radius:10px;padding:14px}
+.v{font-size:24px;font-weight:700;margin-top:6px}.muted{color:#94a3b8;font-size:13px}.ok{color:#4ade80}.bad{color:#f87171}
+pre{white-space:pre-wrap;word-break:break-word;background:#020617;padding:12px;border-radius:8px}
+</style>
+</head>
+<body><div class="wrap">
+<h1>客户端 → Ubuntu 链路测试</h1>
+<p class="muted">只测试当前浏览器到服务器的管理链路，以及服务器本地代理/VPN 状态。单次下载 1 MiB、上传 512 KiB。</p>
+<div class="card"><button id="run">开始测试</button><span id="status" class="muted"></span></div>
+<div class="grid">
+<div class="metric"><div class="muted">HTTP RTT 中位数</div><div id="rtt" class="v">—</div></div>
+<div class="metric"><div class="muted">下载带宽</div><div id="down" class="v">—</div></div>
+<div class="metric"><div class="muted">上传带宽</div><div id="up" class="v">—</div></div>
+<div class="metric"><div class="muted">本机代理端口</div><div id="port" class="v">—</div></div>
+<div class="metric"><div class="muted">VPN 出口</div><div id="vpn" class="v">—</div></div>
+<div class="metric"><div class="muted">VPN 出口延迟</div><div id="vlat" class="v">—</div></div>
+</div>
+<div class="card"><div class="muted">详细状态</div><pre id="detail">等待测试…</pre></div>
+</div>
+<script>
+const $=id=>document.getElementById(id);
+function median(a){const b=[...a].sort((x,y)=>x-y);return b.length%2?b[(b.length-1)/2]:(b[b.length/2-1]+b[b.length/2])/2}
+async function timedFetch(url,opts){const t=performance.now();const r=await fetch(url,opts);const data=await r.arrayBuffer();return {r,data,ms:performance.now()-t}}
+async function run(){
+ $('run').disabled=true;$('status').textContent=' 测试中…';
+ try{
+  const rtts=[];let probe=null;
+  for(let i=0;i<5;i++){const t=performance.now();const r=await fetch('./api/link_probe?x='+Math.random(),{cache:'no-store'});probe=await r.json();rtts.push(performance.now()-t);await new Promise(x=>setTimeout(x,120))}
+  $('rtt').textContent=median(rtts).toFixed(1)+' ms';
+  const downBytes=1048576;const d=await timedFetch('./api/link_probe_payload?bytes='+downBytes+'&x='+Math.random(),{cache:'no-store'});
+  if(!d.r.ok)throw new Error('下载测速 HTTP '+d.r.status);
+  $('down').textContent=((downBytes*8)/(d.ms/1000)/1e6).toFixed(2)+' Mbps';
+  const upBytes=524288;const body=new Uint8Array(upBytes);const t=performance.now();
+  const ur=await fetch('./api/link_probe_upload',{method:'POST',body,headers:{'Content-Type':'application/octet-stream'}});
+  const uj=await ur.json();const ums=performance.now()-t;if(!ur.ok||!uj.ok)throw new Error(uj.error||('上传测速 HTTP '+ur.status));
+  $('up').textContent=((upBytes*8)/(ums/1000)/1e6).toFixed(2)+' Mbps';
+  const portOk=!!probe.proxy_port_reachable;$('port').textContent=portOk?'可达':'不可达';$('port').className='v '+(portOk?'ok':'bad');
+  $('vpn').textContent=probe.proxy_ok?(probe.proxy_ip||'正常'):'不可用';$('vpn').className='v '+(probe.proxy_ok?'ok':'bad');
+  $('vlat').textContent=(probe.proxy_latency_ms||0)?probe.proxy_latency_ms+' ms':'—';
+  $('detail').textContent=JSON.stringify(probe,null,2);
+  $('status').textContent=' 完成';
+ }catch(e){$('status').textContent=' 失败: '+e.message}
+ finally{$('run').disabled=false}
+}
+$('run').onclick=run;
+</script></body></html>

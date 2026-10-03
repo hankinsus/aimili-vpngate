@@ -77,6 +77,9 @@ class DualStackHTTPServer(ThreadingHTTPServer):
 
 import vpn_utils
 import proxy_server
+from node_pool import NodePool
+import tunnel_adapters
+import vpngate_discovery
 
 def env_int(name: str, default: int, min_value: int | None = None, max_value: int | None = None) -> int:
     raw = os.environ.get(name)
@@ -92,6 +95,12 @@ def env_int(name: str, default: int, min_value: int | None = None, max_value: in
         print(f"[配置警告] 环境变量 {name}={value} 大于允许值 {max_value}，使用默认值 {default}", flush=True)
         return default
     return value
+
+def env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw in (None, ""):
+        return default
+    return str(raw).strip().lower() in ("1", "true", "yes", "on", "enabled")
 
 def bounded_int(value: Any, default: int, min_value: int | None = None, max_value: int | None = None) -> int:
     try:
@@ -112,6 +121,16 @@ MAX_SCAN_ROWS = env_int("MAX_SCAN_ROWS", 5000, 1)
 OPENVPN_TEST_TIMEOUT_SECONDS = env_int("OPENVPN_TEST_TIMEOUT_SECONDS", 35, 1)
 MANUAL_TEST_NODE_LIMIT = env_int("MANUAL_TEST_NODE_LIMIT", 5, 1, 20)
 INITIAL_CONNECT_TEST_LIMIT = env_int("INITIAL_CONNECT_TEST_LIMIT", 10, 1, 50)
+BACKGROUND_PROBE_BATCH = env_int("BACKGROUND_PROBE_BATCH", 20, 5, 100)
+ACTIVE_BACKGROUND_PROBE_BATCH = env_int("ACTIVE_BACKGROUND_PROBE_BATCH", 3, 1, 20)
+PROTOCOL_PROBE_BATCH = env_int("PROTOCOL_PROBE_BATCH", 3, 1, 10)
+PROTOCOL_PROBE_INTERVAL_SECONDS = env_int("PROTOCOL_PROBE_INTERVAL_SECONDS", 600, 120, 3600)
+PROXY_HEALTH_INTERVAL_SECONDS = env_int("PROXY_HEALTH_INTERVAL_SECONDS", 15, 5, 120)
+PROXY_HEALTH_CONFIRM_DELAY_SECONDS = env_int("PROXY_HEALTH_CONFIRM_DELAY_SECONDS", 2, 1, 10)
+HOT_POOL_TARGET = env_int("HOT_POOL_TARGET", 8, 5, 10)
+LINK_PROBE_MAX_BYTES = env_int("LINK_PROBE_MAX_BYTES", 1048576, 65536, 4194304)
+LINK_PROBE_WINDOW_BYTES = env_int("LINK_PROBE_WINDOW_BYTES", 4194304, 262144, 16777216)
+LINK_PROBE_WINDOW_SECONDS = env_int("LINK_PROBE_WINDOW_SECONDS", 60, 10, 300)
 OPENVPN_CMD = os.environ.get("OPENVPN_CMD", "openvpn")
 OPENVPN_AUTH_USER = os.environ.get("OPENVPN_AUTH_USER", "vpn")
 OPENVPN_AUTH_PASS = os.environ.get("OPENVPN_AUTH_PASS", "vpn")
@@ -119,6 +138,15 @@ LOCAL_PROXY_HOST = os.environ.get("LOCAL_PROXY_HOST", "127.0.0.1")
 LOCAL_PROXY_PORT = env_int("LOCAL_PROXY_PORT", 7928, 1, 65535)
 UI_HOST = os.environ.get("UI_HOST", "::")
 UI_PORT = env_int("UI_PORT", 8787, 1, 65535)
+ACTIVE_ROUTE_TABLE = env_int("ACTIVE_ROUTE_TABLE", 100, 1, 252)
+ISOLATED_INSTANCE = env_flag("ISOLATED_INSTANCE", False)
+DISABLE_BACKGROUND_LOOPS = env_flag("DISABLE_BACKGROUND_LOOPS", False)
+ENABLE_COLLECTOR_LOOP = env_flag("ENABLE_COLLECTOR_LOOP", not DISABLE_BACKGROUND_LOOPS)
+ENABLE_PROXY_HEALTH_LOOP = env_flag("ENABLE_PROXY_HEALTH_LOOP", not DISABLE_BACKGROUND_LOOPS)
+ENABLE_FAST_LIVENESS_LOOP = env_flag("ENABLE_FAST_LIVENESS_LOOP", not DISABLE_BACKGROUND_LOOPS)
+FAST_LIVENESS_INTERVAL_SECONDS = env_int("FAST_LIVENESS_INTERVAL_SECONDS", 2, 1, 10)
+ENABLE_PINGER_LOOP = env_flag("ENABLE_PINGER_LOOP", not DISABLE_BACKGROUND_LOOPS)
+ENABLE_PROTOCOL_PROBE_LOOP = env_flag("ENABLE_PROTOCOL_PROBE_LOOP", not DISABLE_BACKGROUND_LOOPS)
 INVALID_BACKOFF_SECONDS = env_int("INVALID_BACKOFF_SECONDS", 30 * 60, 1)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
@@ -129,12 +157,23 @@ STATE_FILE = DATA_DIR / "state.json"
 AUTH_FILE = DATA_DIR / "vpngate_auth.txt"
 UPSTREAM_PROXY_AUTH_FILE = DATA_DIR / "upstream_proxy_auth.txt"
 BLACKLIST_FILE = DATA_DIR / "blacklist.json"
+NODE_POOL_DB = DATA_DIR / "node_pool.sqlite3"
+node_pool = NodePool(NODE_POOL_DB)
+l2tp_adapter = tunnel_adapters.L2TPIPsecAdapter()
 
 lock = threading.RLock()
 maintenance_lock = threading.Lock()
 active_sessions: dict[str, float] = {}
 active_openvpn_process: subprocess.Popen[str] | None = None
 active_openvpn_node_id = ""
+active_external_tunnel: tunnel_adapters.TunnelResult | None = None
+active_pool_endpoint_id = ""
+protocol_discovery_lock = threading.Lock()
+protocol_probe_lock = threading.Lock()
+failover_lock = threading.Lock()
+link_probe_lock = threading.Lock()
+link_probe_usage: dict[str, tuple[float, int]] = {}
+last_protocol_discovery_at = 0.0
 is_connecting = False
 last_active_ping_time = 0.0
 last_active_latency = 0
@@ -350,10 +389,37 @@ def read_nodes() -> list[dict[str, Any]]:
     return [item for item in raw if isinstance(item, dict)]
 
 def get_state() -> dict[str, Any]:
-    global active_openvpn_node_id, is_connecting
+    global active_openvpn_node_id, active_pool_endpoint_id, is_connecting
     state = read_json(STATE_FILE, {})
     state.pop("password", None)
     state["active_openvpn_node_id"] = active_openvpn_node_id
+    state["active_pool_endpoint_id"] = active_pool_endpoint_id
+    state["active_pool_endpoint"] = None
+    if active_pool_endpoint_id:
+        try:
+            endpoint = node_pool.get_endpoint(active_pool_endpoint_id)
+            if endpoint:
+                state["active_pool_endpoint"] = {
+                    "endpoint_id": endpoint.get("endpoint_id", ""),
+                    "protocol": endpoint.get("protocol", ""),
+                    "transport": endpoint.get("transport", ""),
+                    "port": endpoint.get("port", 0),
+                    "hostname": endpoint.get("hostname", ""),
+                    "current_ip": endpoint.get("current_ip", ""),
+                    "country": endpoint.get("country", ""),
+                    "latency_ms": endpoint.get("latency_ewma", 0),
+                    "jitter_ms": endpoint.get("jitter_ewma", 0),
+                    "selection_score": endpoint.get("selection_score", 0),
+                }
+        except Exception:
+            pass
+    state["active_tunnel_interface"] = proxy_server.get_active_interface() if active_tunnel_running() else ""
+    if active_external_tunnel is not None:
+        state["active_tunnel_protocol"] = active_external_tunnel.protocol
+    elif active_openvpn_running():
+        state["active_tunnel_protocol"] = "openvpn"
+    else:
+        state.setdefault("active_tunnel_protocol", "")
     state["is_connecting"] = is_connecting
     state["maintenance_running"] = maintenance_lock.locked()
     state.setdefault("api_url", API_URL)
@@ -388,10 +454,31 @@ def safe_name(value: str) -> str:
     return value.strip("._") or "node"
 
 def clear_active_connection_state(message: str) -> None:
-    global active_openvpn_process, active_openvpn_node_id
+    global active_openvpn_process, active_openvpn_node_id, active_external_tunnel, active_pool_endpoint_id
     stop_process(active_openvpn_process)
     active_openvpn_process = None
     active_openvpn_node_id = ""
+    if active_external_tunnel is not None:
+        try:
+            if active_external_tunnel.protocol == "softether":
+                details = active_external_tunnel.details or {}
+                tunnel_adapters.SoftEtherAdapter().disconnect(
+                    account=str(details.get("account") or "aimili"),
+                    nic=str(details.get("nic") or "aimili"),
+                    delete=True,
+                    added_routes=details.get("added_host_routes") or [],
+                )
+            elif active_external_tunnel.protocol == "sstp":
+                details = active_external_tunnel.details or {}
+                tunnel_adapters.SSTPAdapter.disconnect(
+                    active_external_tunnel.process,
+                    added_routes=details.get("added_host_routes") or [],
+                )
+        except Exception:
+            pass
+    active_external_tunnel = None
+    active_pool_endpoint_id = ""
+    cleanup_policy_routing()
     with lock:
         nodes = read_nodes()
         for item in nodes:
@@ -399,6 +486,9 @@ def clear_active_connection_state(message: str) -> None:
         write_json(NODES_FILE, nodes)
     set_state(
         active_openvpn_node_id="",
+        active_pool_endpoint_id="",
+        active_tunnel_protocol="",
+        active_tunnel_interface="",
         is_connecting=False,
         active_node_latency="无活动连接",
         last_check_message=message,
@@ -817,6 +907,12 @@ def fetch_candidates() -> list[dict[str, Any]]:
         last_fetch_message=f"Fetched {len(candidates)} unique candidates across multiple attempts.",
         blacklisted_nodes=len(blacklist),
     )
+    try:
+        node_pool.upsert_openvpn_snapshot(candidates, source="official_csv")
+    except Exception as pool_exc:
+        print(f"[NodePool] 官方 CSV 快照写入失败: {pool_exc}", flush=True)
+        log_to_json("WARNING", "Main", f"NodePool 快照写入失败: {pool_exc}")
+
     log_to_json("INFO", "Main", f"成功获取官方 API 节点，共 {len(candidates)} 个候选节点")
     return candidates
 
@@ -916,6 +1012,8 @@ def stop_process(process: subprocess.Popen[str] | None) -> None:
         process.kill()
 
 def kill_existing_openvpn_processes() -> None:
+    if ISOLATED_INSTANCE:
+        return
     if not sys.platform.startswith("linux"):
         return
     try:
@@ -1086,21 +1184,28 @@ def run_openvpn_until_ready(config_file: str, keep_alive: bool, route_nopull: bo
     return ok, message, process
 
 
-def setup_policy_routing(interface: str = "tun0") -> None:
+def setup_policy_routing(interface: str = "tun0", gateway: str = "") -> None:
     try:
-        subprocess.run(["ip", "rule", "del", "table", "100"], capture_output=True, timeout=2)
+        subprocess.run(["ip", "rule", "del", "table", str(ACTIVE_ROUTE_TABLE)], capture_output=True, timeout=2)
     except Exception:
         pass
     try:
-        subprocess.run(["ip", "route", "flush", "table", "100"], capture_output=True, timeout=2)
+        subprocess.run(["ip", "route", "flush", "table", str(ACTIVE_ROUTE_TABLE)], capture_output=True, timeout=2)
     except Exception:
         pass
     
     success = False
     for attempt in range(1, 4):
         try:
-            subprocess.run(["ip", "route", "add", "default", "dev", interface, "table", "100"], check=True, timeout=2)
-            subprocess.run(["ip", "rule", "add", "oif", interface, "table", "100"], check=True, timeout=2)
+            route_cmd = ["ip", "route", "add", "default"]
+            if gateway:
+                route_cmd.extend(["via", gateway])
+            route_cmd.extend(["dev", interface])
+            if gateway:
+                route_cmd.append("onlink")
+            route_cmd.extend(["table", str(ACTIVE_ROUTE_TABLE)])
+            subprocess.run(route_cmd, check=True, timeout=2)
+            subprocess.run(["ip", "rule", "add", "oif", interface, "table", str(ACTIVE_ROUTE_TABLE)], check=True, timeout=2)
             # 配置反向路径过滤 rp_filter 为 loose 模式 (2)，防止回包被内核静默丢弃
             for proc_path in ["all", "default", interface]:
                 try:
@@ -1115,14 +1220,14 @@ def setup_policy_routing(interface: str = "tun0") -> None:
             time.sleep(1)
             
     if not success:
-        print("[路由配置失败] [错误代码 3003] [ERR_ROUTE_TABLE_ADD_FAILED] 策略路由配置失败。原因: 无法向路由表 100 添加默认路由，这可能会导致通过 VPN 接口的出站路由无法正常解析。请检查系统是否支持策略路由、iproute2 工具是否完整，以及是否具有 root 权限。", flush=True)
-        log_to_json("ERROR", "Routing", "[错误代码 3003] [ERR_ROUTE_TABLE_ADD_FAILED] 策略路由配置失败。原因: 无法向路由表 100 添加默认路由")
+        print(f"[路由配置失败] [错误代码 3003] [ERR_ROUTE_TABLE_ADD_FAILED] 策略路由配置失败。原因: 无法向路由表 {ACTIVE_ROUTE_TABLE} 添加默认路由，这可能会导致通过 VPN 接口的出站路由无法正常解析。请检查系统是否支持策略路由、iproute2 工具是否完整，以及是否具有 root 权限。", flush=True)
+        log_to_json("ERROR", "Routing", f"[错误代码 3003] [ERR_ROUTE_TABLE_ADD_FAILED] 策略路由配置失败。原因: 无法向路由表 {ACTIVE_ROUTE_TABLE} 添加默认路由")
 
 def cleanup_policy_routing() -> None:
     try:
-        subprocess.run(["ip", "rule", "del", "table", "100"], capture_output=True, timeout=2)
-        subprocess.run(["ip", "route", "flush", "table", "100"], capture_output=True, timeout=2)
-        print("[policy_routing] Cleared policy routing table 100", flush=True)
+        subprocess.run(["ip", "rule", "del", "table", str(ACTIVE_ROUTE_TABLE)], capture_output=True, timeout=2)
+        subprocess.run(["ip", "route", "flush", "table", str(ACTIVE_ROUTE_TABLE)], capture_output=True, timeout=2)
+        print(f"[policy_routing] Cleared policy routing table {ACTIVE_ROUTE_TABLE}", flush=True)
     except Exception:
         pass
 
@@ -1140,7 +1245,8 @@ def stop_active_openvpn() -> None:
         stop_process(active_openvpn_process)
         active_openvpn_process = None
         active_openvpn_node_id = ""
-        kill_existing_openvpn_processes()
+        if not ISOLATED_INSTANCE:
+            kill_existing_openvpn_processes()
         
         if config_to_delete:
             try:
@@ -1152,6 +1258,225 @@ def stop_active_openvpn() -> None:
 
 def active_openvpn_running() -> bool:
     return active_openvpn_process is not None and active_openvpn_process.poll() is None
+
+def active_external_tunnel_running() -> bool:
+    tunnel = active_external_tunnel
+    if tunnel is None or not tunnel.ok or not tunnel.interface:
+        return False
+    return tunnel_adapters.interface_has_ipv4(tunnel.interface)
+
+def active_tunnel_running() -> bool:
+    return active_openvpn_running() or active_external_tunnel_running()
+
+def stop_active_external_tunnel() -> None:
+    global active_external_tunnel, active_pool_endpoint_id
+    tunnel = active_external_tunnel
+    if tunnel is None:
+        active_pool_endpoint_id = ""
+        return
+    try:
+        if tunnel.protocol == "softether":
+            details = tunnel.details or {}
+            tunnel_adapters.SoftEtherAdapter().disconnect(
+                account=str(details.get("account") or "aimili"),
+                nic=str(details.get("nic") or "aimili"),
+                delete=True,
+                added_routes=details.get("added_host_routes") or [],
+            )
+        elif tunnel.protocol == "sstp":
+            details = tunnel.details or {}
+            tunnel_adapters.SSTPAdapter.disconnect(
+                tunnel.process,
+                added_routes=details.get("added_host_routes") or [],
+            )
+        elif tunnel.protocol == "l2tp-ipsec":
+            l2tp_adapter.disconnect(tunnel.namespace or "aimili-l2tp-prod")
+    except Exception as exc:
+        log_to_json("WARNING", "VPN", f"停止 {tunnel.protocol} 隧道失败: {exc}")
+    cleanup_policy_routing()
+    proxy_server.clear_active_interface()
+    active_external_tunnel = None
+    active_pool_endpoint_id = ""
+    set_state(active_pool_endpoint_id="", active_tunnel_protocol="", active_tunnel_interface="")
+
+def stop_all_tunnels() -> None:
+    stop_active_external_tunnel()
+    stop_active_openvpn()
+
+def refresh_multi_protocol_catalog(force: bool = False) -> dict[str, Any]:
+    global last_protocol_discovery_at
+    now = time.time()
+    if not force and now - last_protocol_discovery_at < 300:
+        return {"ok": True, "skipped": True, "pool": node_pool.stats()}
+    if not protocol_discovery_lock.acquire(blocking=False):
+        return {"ok": True, "running": True, "pool": node_pool.stats()}
+    try:
+        servers, sources = vpngate_discovery.fetch_multi_source_tables(max_mirrors=2)
+        node_pool.upsert_discovery_snapshot(servers, source="official_html_multi")
+        last_protocol_discovery_at = time.time()
+        stats = node_pool.stats()
+        set_state(
+            protocol_catalog_last_at=last_protocol_discovery_at,
+            protocol_catalog_count=len(servers),
+            protocol_catalog_sources=len(sources),
+        )
+        log_to_json("INFO", "Main", f"多协议目录刷新完成，本轮合并 {len(servers)} 台服务器，来源 {len(sources)} 个，Master Pool={stats}")
+        return {"ok": True, "servers": len(servers), "sources": sources, "pool": stats}
+    except Exception as exc:
+        log_to_json("WARNING", "Main", f"多协议目录刷新失败: {exc}")
+        return {"ok": False, "error": str(exc), "pool": node_pool.stats()}
+    finally:
+        protocol_discovery_lock.release()
+
+def connect_pool_endpoint(endpoint_id: str) -> str:
+    global active_external_tunnel, active_pool_endpoint_id, active_openvpn_node_id, is_connecting
+    endpoint_id = str(endpoint_id or "").strip()
+    endpoint = node_pool.get_endpoint(endpoint_id)
+    if endpoint is None:
+        raise ValueError("Protocol endpoint not found")
+    protocol = str(endpoint.get("protocol") or "").lower()
+    metadata = endpoint.get("metadata") or {}
+    if protocol != "openvpn" and not metadata.get("trusted_observation"):
+        raise RuntimeError("该协议端点目前仅由单一 Mirror 发现，尚未通过主站或多源交叉确认")
+    if protocol not in ("softether", "sstp", "l2tp-ipsec"):
+        raise RuntimeError(f"协议 {protocol} 当前尚未开放生产连接")
+
+    if protocol == "softether" and not tunnel_adapters.SoftEtherAdapter.available():
+        raise RuntimeError("SoftEther 客户端组件未安装")
+    if protocol == "sstp" and not tunnel_adapters.SSTPAdapter.available():
+        raise RuntimeError("SSTP 客户端组件未安装")
+    if protocol == "l2tp-ipsec":
+        l2tp_env = tunnel_adapters.L2TPIPsecAdapter.environment_report(run_kernel_test=False)
+        if not l2tp_env.get("ready"):
+            raise RuntimeError(f"L2TP/IPsec 隔离环境未就绪: {l2tp_env}")
+
+    with lock:
+        if is_connecting:
+            raise RuntimeError("当前已有连接或节点检测任务正在运行，请稍后再试")
+        is_connecting = True
+
+    result: tunnel_adapters.TunnelResult | None = None
+    promoted = False
+    token = re.sub(r"[^a-z0-9]", "", endpoint_id.lower())[:8] or uuid.uuid4().hex[:8]
+
+    def cleanup_new() -> None:
+        if result is None:
+            return
+        try:
+            if result.protocol == "softether":
+                details = result.details or {}
+                tunnel_adapters.SoftEtherAdapter().disconnect(
+                    account=str(details.get("account") or f"prod{token}"),
+                    nic=str(details.get("nic") or f"a{token}"),
+                    delete=True,
+                    added_routes=details.get("added_host_routes") or [],
+                )
+            elif result.protocol == "sstp":
+                details = result.details or {}
+                tunnel_adapters.SSTPAdapter.disconnect(
+                    result.process,
+                    added_routes=details.get("added_host_routes") or [],
+                )
+            elif result.protocol == "l2tp-ipsec":
+                l2tp_adapter.disconnect(result.namespace)
+        except Exception:
+            pass
+
+    try:
+        set_state(is_connecting=True, last_check_message=f"正在预连接并验证 {protocol} 端点 {endpoint_id}")
+
+        metadata = endpoint.get("metadata") or {}
+        host = str(metadata.get("hostname") or endpoint.get("hostname") or endpoint.get("current_ip") or "").strip()
+        if not host:
+            raise RuntimeError("端点缺少可连接的 Hostname/IP")
+        port = parse_int(endpoint.get("port"))
+
+        # Make-before-break: establish a completely separate candidate tunnel
+        # while the existing production 7928 path continues serving traffic.
+        if protocol == "softether":
+            result = tunnel_adapters.SoftEtherAdapter().connect(
+                host=host,
+                port=port or 443,
+                account=f"prod{token}",
+                nic=f"a{token}",
+                username="vpn",
+                password="vpn",
+            )
+        elif protocol == "sstp":
+            result = tunnel_adapters.SSTPAdapter().connect(
+                hostname=host if port in (0, 443) else f"{host}:{port}",
+                username="vpn",
+                password="vpn",
+                timeout=20,
+            )
+        else:
+            result = l2tp_adapter.connect(
+                host=host,
+                username="vpn",
+                password="vpn",
+                psk="vpn",
+                namespace=f"aimili-l2tp-{token}",
+                timeout=35,
+            )
+
+        if not result.ok or not result.interface:
+            node_pool.record_endpoint_probe(endpoint_id, False, 0, result.message)
+            raise RuntimeError(result.message or f"{protocol} 连接失败")
+
+        direct_health = (
+            tunnel_adapters.L2TPIPsecAdapter.egress_check(result)
+            if protocol == "l2tp-ipsec"
+            else check_interface_egress(result.interface, result.gateway)
+        )
+        if not direct_health.get("ok"):
+            message = str(direct_health.get("error") or "候选隧道出口检测失败")
+            node_pool.record_endpoint_probe(endpoint_id, False, 0, message)
+            raise RuntimeError(message)
+
+        # Candidate is independently verified. Only now release the old tunnel.
+        if active_external_tunnel is not None:
+            stop_active_external_tunnel()
+        if active_openvpn_running():
+            stop_active_openvpn()
+
+        active_external_tunnel = result
+        active_pool_endpoint_id = endpoint_id
+        active_openvpn_node_id = ""
+        proxy_server.set_active_interface(result.interface)
+        setup_policy_routing(result.interface, gateway=result.gateway)
+        promoted = True
+
+        health = check_proxy_health()
+        if not health.get("ok"):
+            node_pool.record_endpoint_probe(endpoint_id, False, 0, str(health.get("error") or "7928 代理出口检测失败"))
+            stop_active_external_tunnel()
+            raise RuntimeError(str(health.get("error") or "7928 代理出口检测失败"))
+
+        latency = parse_int(health.get("latency_ms")) or parse_int(direct_health.get("latency_ms"))
+        node_pool.record_endpoint_probe(endpoint_id, True, latency, "production connect ok")
+        set_state(
+            active_pool_endpoint_id=endpoint_id,
+            active_tunnel_protocol=protocol,
+            active_tunnel_interface=result.interface,
+            proxy_ok=True,
+            proxy_ip=health.get("ip", ""),
+            proxy_latency_ms=latency,
+            proxy_error="",
+            is_connecting=False,
+            last_check_message=f"Connected {protocol} {endpoint_id}",
+        )
+        log_to_json(
+            "INFO",
+            "VPN",
+            f"{protocol} 候选隧道验证成功后接管 7928，接口 {result.interface}",
+        )
+        return f"Connected {protocol} endpoint {endpoint_id}"
+    except Exception:
+        if not promoted:
+            cleanup_new()
+        raise
+    finally:
+        is_connecting = False
 
 def sort_all_nodes(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
     available_nodes = sorted(
@@ -1395,6 +1720,10 @@ def test_node_by_id(node_id: str) -> dict[str, Any]:
                 node["ip_type"] = temp_node["ip_type"]
                 node["quality"] = temp_node["quality"]
             
+            try:
+                node_pool.record_probe(node, ok=ok, latency_ms=latency, message=message)
+            except Exception as pool_exc:
+                log_to_json("WARNING", "Main", f"NodePool 单节点探测结果写入失败: {pool_exc}")
             sorted_nodes = sort_all_nodes(nodes)
             write_json(NODES_FILE, sorted_nodes)
             res = next((item for item in sorted_nodes if item.get("id") == node_id), node)
@@ -1477,7 +1806,7 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
     updated_nodes_map = {}
     # Protect the production proxy path from CPU/TUN contention while still
     # refreshing the full candidate pool in the background.
-    probe_worker_limit = 2 if active_openvpn_running() else 5
+    probe_worker_limit = 2 if active_tunnel_running() else 5
     max_workers = min(probe_worker_limit, max(1, len(to_test)))
     completed_since_flush = 0
     last_flush_at = time.time()
@@ -1488,6 +1817,17 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
             try:
                 res = future.result()
                 updated_nodes_map[nid] = res
+                try:
+                    original_node = next((item for item in to_test if item.get("id") == nid), None)
+                    if original_node:
+                        node_pool.record_probe(
+                            original_node,
+                            ok=res.get("probe_status") == "available",
+                            latency_ms=parse_int(res.get("latency_ms")),
+                            message=str(res.get("probe_message") or ""),
+                        )
+                except Exception as pool_exc:
+                    log_to_json("WARNING", "Main", f"NodePool 批量探测结果写入失败: {pool_exc}")
             except Exception as e:
                 updated_nodes_map[nid] = {
                     "id": nid,
@@ -1495,6 +1835,12 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
                     "probe_message": f"Test exception: {e}",
                     "latency_ms": 0
                 }
+                try:
+                    original_node = next((item for item in to_test if item.get("id") == nid), None)
+                    if original_node:
+                        node_pool.record_probe(original_node, False, 0, f"Test exception: {e}")
+                except Exception as pool_exc:
+                    log_to_json("WARNING", "Main", f"NodePool 异常探测结果写入失败: {pool_exc}")
 
             # Avoid re-reading and rewriting the entire nodes.json after every
             # single probe completion. Flush small batches so the UI remains
@@ -1630,7 +1976,7 @@ def connect_node(node_id: str) -> str:
             write_json(auth_file, ui_cfg)
         
         set_state(active_node_latency="清理连接", last_check_message="正在关闭与清理旧的 VPN 连接及网卡...")
-        stop_active_openvpn()
+        stop_all_tunnels()
         stopped_existing = True
 
         set_state(active_node_latency="写入配置", last_check_message="正在写入 OpenVPN 节点配置文件...")
@@ -1664,7 +2010,9 @@ def connect_node(node_id: str) -> str:
         with lock:
             active_openvpn_process = process
             active_openvpn_node_id = node_id
-        
+
+        proxy_server.set_active_interface("tun0")
+        set_state(active_tunnel_protocol="openvpn", active_tunnel_interface="tun0")
         set_state(active_node_latency="配置路由", last_check_message="正在配置策略路由规则与流量转发...")
         setup_policy_routing("tun0")
         
@@ -1721,6 +2069,348 @@ def connect_node(node_id: str) -> str:
         with lock:
             is_connecting = False
 
+PROBE_ROUTE_TABLE = 200
+
+def cleanup_probe_policy_routing(table: int = PROBE_ROUTE_TABLE) -> None:
+    try:
+        subprocess.run(["ip", "rule", "del", "table", str(table)], capture_output=True, timeout=2)
+    except Exception:
+        pass
+    try:
+        subprocess.run(["ip", "route", "flush", "table", str(table)], capture_output=True, timeout=2)
+    except Exception:
+        pass
+
+def setup_probe_policy_routing(interface: str, gateway: str = "", table: int = PROBE_ROUTE_TABLE) -> tuple[bool, str]:
+    interface = str(interface or "").strip()
+    gateway = str(gateway or "").strip()
+    if not interface:
+        return False, "缺少测试网卡"
+    cleanup_probe_policy_routing(table)
+    try:
+        route_cmd = ["ip", "route", "add", "default"]
+        if gateway:
+            route_cmd.extend(["via", gateway])
+        route_cmd.extend(["dev", interface])
+        if gateway:
+            route_cmd.append("onlink")
+        route_cmd.extend(["table", str(table)])
+        subprocess.run(route_cmd, capture_output=True, text=True, check=True, timeout=3)
+        subprocess.run(
+            ["ip", "rule", "add", "oif", interface, "table", str(table)],
+            capture_output=True, text=True, check=True, timeout=3,
+        )
+        return True, ""
+    except Exception as exc:
+        cleanup_probe_policy_routing(table)
+        return False, str(exc)
+
+def check_interface_egress(interface: str, gateway: str = "") -> dict[str, Any]:
+    interface = str(interface or "").strip()
+    if not interface:
+        return {"ok": False, "error": "缺少测试网卡"}
+
+    route_ok, route_error = setup_probe_policy_routing(interface, gateway)
+    if not route_ok:
+        return {"ok": False, "error": f"临时策略路由建立失败: {route_error}"}
+
+    cmd = [
+        "curl", "-4", "-sS",
+        "--interface", f"if!{interface}",
+        "-w", "\n%{time_total} %{http_code}",
+        "https://api.ipify.org",
+        "--connect-timeout", "4",
+        "--max-time", "8",
+    ]
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=9)
+        if res.returncode != 0:
+            diagnostics: list[str] = [f"curl_exit={res.returncode}", f"gateway={gateway or '-'}"]
+            if res.stderr:
+                diagnostics.append(f"curl_error={res.stderr.strip()[-500:]}")
+            for label, diag_cmd in [
+                ("addr", ["ip", "-4", "addr", "show", "dev", interface]),
+                ("table200", ["ip", "route", "show", "table", str(PROBE_ROUTE_TABLE)]),
+                ("route_get", ["ip", "route", "get", "1.1.1.1", "oif", interface]),
+            ]:
+                try:
+                    diag = subprocess.run(diag_cmd, capture_output=True, text=True, timeout=3)
+                    diagnostics.append(f"{label}={(diag.stdout or diag.stderr).strip()[-700:]}")
+                except Exception as exc:
+                    diagnostics.append(f"{label}_error={exc}")
+            return {"ok": False, "error": " | ".join(diagnostics)}
+        lines = res.stdout.strip().splitlines()
+        if len(lines) < 2:
+            return {"ok": False, "error": "测试出口没有返回有效结果"}
+        ip = lines[0].strip()
+        timing = lines[-1].split()
+        if len(timing) != 2 or timing[1] != "200":
+            return {"ok": False, "error": f"测试出口 HTTP 异常: {lines[-1]}"}
+        latency_ms = int(float(timing[0]) * 1000)
+        return {"ok": True, "ip": ip, "latency_ms": latency_ms}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+    finally:
+        cleanup_probe_policy_routing()
+
+def probe_pool_endpoint(endpoint_id: str) -> dict[str, Any]:
+    endpoint_id = str(endpoint_id or "").strip()
+    if not endpoint_id:
+        return {"ok": False, "error": "endpoint_id 为空"}
+    if is_connecting:
+        return {"ok": False, "skipped": True, "error": "生产连接正在切换，跳过后台探测"}
+    if not protocol_probe_lock.acquire(blocking=False):
+        return {"ok": False, "skipped": True, "error": "已有协议探测任务运行中"}
+
+    endpoint = node_pool.get_endpoint(endpoint_id)
+    if endpoint is None:
+        protocol_probe_lock.release()
+        return {"ok": False, "error": "端点不存在"}
+
+    protocol = str(endpoint.get("protocol") or "").lower()
+    metadata = endpoint.get("metadata") or {}
+    host = str(metadata.get("hostname") or endpoint.get("hostname") or endpoint.get("current_ip") or "").strip()
+    port = parse_int(endpoint.get("port"))
+    token = re.sub(r"[^a-z0-9]", "", endpoint_id.lower())[:10] or uuid.uuid4().hex[:10]
+    result: tunnel_adapters.TunnelResult | None = None
+    cleanup = None
+
+    try:
+        if protocol == "softether":
+            account = f"probe{token}"
+            nic = f"p{token}"
+            adapter = tunnel_adapters.SoftEtherAdapter()
+            result = adapter.connect(
+                host=host,
+                port=port or 443,
+                account=account,
+                nic=nic,
+                username="vpn",
+                password="vpn",
+            )
+            cleanup = lambda: adapter.disconnect(
+                account=account,
+                nic=nic,
+                delete=True,
+                added_routes=((result.details or {}).get("added_host_routes") if result else []),
+            )
+        elif protocol == "sstp":
+            adapter = tunnel_adapters.SSTPAdapter()
+            target = host if port in (0, 443) else f"{host}:{port}"
+            result = adapter.connect(target, username="vpn", password="vpn", timeout=20)
+            cleanup = lambda: tunnel_adapters.SSTPAdapter.disconnect(
+                result.process if result else None,
+                added_routes=((result.details or {}).get("added_host_routes") if result else []),
+            )
+        elif protocol == "l2tp-ipsec":
+            namespace = f"aimili-l2tp-p{token}"[:31]
+            result = l2tp_adapter.connect(
+                host=host,
+                username="vpn",
+                password="vpn",
+                psk="vpn",
+                namespace=namespace,
+                timeout=35,
+            )
+            cleanup = lambda: l2tp_adapter.disconnect(namespace)
+        else:
+            return {"ok": False, "skipped": True, "error": f"协议 {protocol} 暂不允许后台实连测试"}
+
+        if result is None or not result.ok or not result.interface:
+            message = result.message if result else "隧道未建立"
+            node_pool.record_endpoint_probe(endpoint_id, False, 0, message)
+            return {"ok": False, "protocol": protocol, "error": message}
+
+        egress = (
+            tunnel_adapters.L2TPIPsecAdapter.egress_check(result)
+            if protocol == "l2tp-ipsec"
+            else check_interface_egress(result.interface, result.gateway)
+        )
+        if not egress.get("ok"):
+            message = str(egress.get("error") or "接口出口不可用")
+            node_pool.record_endpoint_probe(endpoint_id, False, 0, message)
+            return {"ok": False, "protocol": protocol, "interface": result.interface, "error": message}
+
+        latency_ms = parse_int(egress.get("latency_ms"))
+        node_pool.record_endpoint_probe(endpoint_id, True, latency_ms, "background egress probe ok")
+        return {
+            "ok": True,
+            "protocol": protocol,
+            "interface": result.interface,
+            "ip": egress.get("ip", ""),
+            "latency_ms": latency_ms,
+        }
+    except Exception as exc:
+        try:
+            node_pool.record_endpoint_probe(endpoint_id, False, 0, str(exc))
+        except Exception:
+            pass
+        return {"ok": False, "protocol": protocol, "error": str(exc)}
+    finally:
+        if cleanup is not None:
+            try:
+                cleanup()
+            except Exception:
+                pass
+        protocol_probe_lock.release()
+
+def protocol_probe_loop() -> None:
+    # Give the production gateway time to establish its first route before
+    # starting low-priority standby validation.
+    time.sleep(90)
+    while True:
+        try:
+            if is_connecting:
+                time.sleep(15)
+                continue
+            current_hot = node_pool.ranked_hot_pool(limit=HOT_POOL_TARGET, per_server_limit=2)
+            deficit = max(0, HOT_POOL_TARGET - len(current_hot))
+            if deficit > 0:
+                desired = min(PROTOCOL_PROBE_BATCH, max(1, deficit))
+                limit = 1 if active_tunnel_running() else desired
+            else:
+                # Pool is healthy: validate only one due non-OpenVPN endpoint
+                # per cycle so new protocol resources still get a chance.
+                limit = 1
+            due = node_pool.due_endpoints(("softether", "sstp", "l2tp-ipsec"), limit=limit)
+            set_state(hot_pool_size=len(current_hot), hot_pool_target=HOT_POOL_TARGET)
+            if due:
+                log_to_json(
+                    "INFO",
+                    "Probe",
+                    f"多协议热备低频探测，本轮 {len(due)} 个端点，Hot Pool {len(current_hot)}/{HOT_POOL_TARGET}",
+                )
+            for endpoint in due:
+                if is_connecting:
+                    break
+                endpoint_id = str(endpoint.get("endpoint_id") or "")
+                result = probe_pool_endpoint(endpoint_id)
+                if result.get("ok"):
+                    log_to_json("INFO", "Probe", f"热备端点可用 {endpoint_id}: {result}")
+                elif not result.get("skipped"):
+                    log_to_json("WARNING", "Probe", f"热备端点不可用 {endpoint_id}: {result.get('error')}")
+                time.sleep(2)
+        except Exception as exc:
+            log_to_json("ERROR", "Probe", f"多协议热备探测循环异常: {exc}")
+        time.sleep(PROTOCOL_PROBE_INTERVAL_SECONDS)
+
+def openvpn_pool_endpoint_id(node: dict[str, Any] | None) -> str:
+    if not node:
+        return ""
+    try:
+        key = node_pool.server_key(node)
+        return node_pool.endpoint_id(
+            key,
+            "openvpn",
+            str(node.get("proto") or "unknown").lower(),
+            parse_int(node.get("remote_port")),
+        )
+    except Exception:
+        return ""
+
+def connect_ranked_endpoint(endpoint: dict[str, Any]) -> str:
+    protocol = str(endpoint.get("protocol") or "").lower()
+    if protocol == "openvpn":
+        metadata = endpoint.get("metadata") or {}
+        node_id = str(metadata.get("node_id") or "").strip()
+        if not node_id:
+            raise RuntimeError("OpenVPN Hot Pool 端点缺少 node_id")
+        return connect_node(node_id)
+    return connect_pool_endpoint(str(endpoint.get("endpoint_id") or ""))
+
+def endpoint_allowed_by_pool_routing(endpoint: dict[str, Any], ui_cfg: dict[str, Any]) -> bool:
+    routing_mode = ui_cfg.get("routing_mode", "auto")
+    if routing_mode in ("fixed_ip", "favorites"):
+        return False
+    if routing_mode == "fixed_region":
+        target_country = ui_cfg.get("force_country", "")
+        if target_country and not country_matches(endpoint.get("country"), target_country):
+            return False
+
+    routing_ip_type = ui_cfg.get("routing_ip_type", "all")
+    if routing_ip_type != "all":
+        server_meta = endpoint.get("server_metadata") or {}
+        ip_type = str(server_meta.get("ip_type") or "")
+        if routing_ip_type == "residential" and ip_type not in ("residential", "mobile"):
+            return False
+        if routing_ip_type == "hosting" and ip_type != "hosting":
+            return False
+    return True
+
+def try_unified_failover(exclude_endpoint_id: str = "", attempts: int = 4) -> bool:
+    if not failover_lock.acquire(blocking=False):
+        # Another watcher is already performing the replacement.
+        return True
+    started = time.time()
+    from_protocol = ""
+    from_endpoint = ""
+    if active_external_tunnel is not None:
+        from_protocol = str(active_external_tunnel.protocol or "")
+        from_endpoint = str(active_pool_endpoint_id or "")
+    elif active_openvpn_running():
+        from_protocol = "openvpn"
+        from_endpoint = str(active_openvpn_node_id or "")
+
+    ui_cfg = load_ui_config()
+    hot_pool = [
+        ep for ep in node_pool.ranked_hot_pool(limit=12, per_server_limit=2)
+        if ep.get("endpoint_id") != exclude_endpoint_id
+        and endpoint_allowed_by_pool_routing(ep, ui_cfg)
+    ]
+    set_state(
+        failover_in_progress=True,
+        failover_started_at=started,
+        failover_from_protocol=from_protocol,
+        failover_from_endpoint=from_endpoint,
+        failover_candidate_count=len(hot_pool),
+    )
+    last_error = ""
+    for endpoint in hot_pool[:max(1, attempts)]:
+        try:
+            connect_ranked_endpoint(endpoint)
+            duration_ms = int((time.time() - started) * 1000)
+            set_state(
+                hot_pool_size=len(hot_pool),
+                hot_pool_selected_score=endpoint.get("selection_score", 0),
+                failover_in_progress=False,
+                last_failover_ok=True,
+                last_failover_at=time.time(),
+                last_failover_duration_ms=duration_ms,
+                last_failover_from_protocol=from_protocol,
+                last_failover_from_endpoint=from_endpoint,
+                last_failover_to_protocol=str(endpoint.get("protocol") or ""),
+                last_failover_to_endpoint=str(endpoint.get("endpoint_id") or ""),
+                last_failover_error="",
+            )
+            log_to_json(
+                "INFO",
+                "VPN",
+                f"统一 Hot Pool 切换成功 {from_protocol or '-'} -> {endpoint.get('protocol')}，耗时 {duration_ms} ms",
+            )
+            failover_lock.release()
+            return True
+        except Exception as exc:
+            last_error = str(exc)
+            log_to_json(
+                "WARNING",
+                "VPN",
+                f"统一 Hot Pool 切换失败 {endpoint.get('protocol')} {endpoint.get('endpoint_id')}: {exc}",
+            )
+    duration_ms = int((time.time() - started) * 1000)
+    set_state(
+        failover_in_progress=False,
+        last_failover_ok=False,
+        last_failover_at=time.time(),
+        last_failover_duration_ms=duration_ms,
+        last_failover_from_protocol=from_protocol,
+        last_failover_from_endpoint=from_endpoint,
+        last_failover_to_protocol="",
+        last_failover_to_endpoint="",
+        last_failover_error=last_error or "无可用 Hot Pool 候选",
+    )
+    failover_lock.release()
+    return False
+
 def maintain_valid_nodes(force: bool = False) -> str:
     global active_openvpn_process, active_openvpn_node_id, is_connecting
     ensure_dirs()
@@ -1738,9 +2428,9 @@ def maintain_valid_nodes(force: bool = False) -> str:
     try:
         if force:
             with lock:
-                stop_active_openvpn()
+                stop_all_tunnels()
             reconnect_fixed_node_if_needed(load_ui_config())
-        elif not active_openvpn_running():
+        elif not active_tunnel_running():
             ui_cfg = load_ui_config()
             routing_mode = ui_cfg.get("routing_mode", "auto")
             connection_enabled = ui_cfg.get("connection_enabled", True)
@@ -1752,16 +2442,26 @@ def maintain_valid_nodes(force: bool = False) -> str:
                     with lock:
                         if active_openvpn_node_id:
                             has_active_id = True
-                            stop_active_openvpn()
+                            stop_all_tunnels()
                     if has_active_id:
                         print("[维护线程] 检测到当前 OpenVPN 进程已意外退出，准备自动切换节点", flush=True)
                         is_connecting = False
                         auto_switch_node()
                         is_connecting = True
+                    elif routing_mode in ("auto", "fixed_region"):
+                        # Warm-start from persisted validated endpoints before
+                        # doing a fresh network-wide scan.
+                        is_connecting = False
+                        try:
+                            if try_unified_failover(attempts=3):
+                                log_to_json("INFO", "VPN", "已从持久化 Hot Pool 快速恢复生产出口")
+                        finally:
+                            is_connecting = True
 
         try:
             set_state(is_connecting=True, last_check_message="正在拉取最新的免费 VPN 节点列表...")
             candidates = fetch_candidates()
+            threading.Thread(target=refresh_multi_protocol_catalog, args=(False,), daemon=True).start()
         except Exception as exc:
             vpn_utils.check_and_fix_dns()
             diag_msg = str(exc)
@@ -1838,7 +2538,7 @@ def maintain_valid_nodes(force: bool = False) -> str:
         should_fast_connect = (
             ui_cfg.get("connection_enabled", True)
             and ui_cfg.get("routing_mode", "auto") != "fixed_ip"
-            and not active_openvpn_running()
+            and not active_tunnel_running()
         )
         if should_fast_connect:
             with lock:
@@ -1874,7 +2574,7 @@ def maintain_valid_nodes(force: bool = False) -> str:
                     is_connecting = False
                     set_state(is_connecting=False, last_check_message="快速首连已找到可用节点，正在建立连接...")
                     auto_switch_node()
-                    if active_openvpn_running():
+                    if active_tunnel_running():
                         valid_nodes_count = len([n for n in read_nodes() if n.get("probe_status") == "available"])
                         message = f"Fetched {len(candidates)} nodes. Fast-tested {len(fast_test_ids)} nodes and connected."
                         set_state(
@@ -1886,16 +2586,28 @@ def maintain_valid_nodes(force: bool = False) -> str:
                         return message
                     is_connecting = True
 
-        # Test remaining non-active nodes from the list
-        with lock:
-            current_nodes = read_nodes()
-            to_test = [
-                n for n in current_nodes
-                if not n.get("active") and n.get("id") not in initial_tested_ids
-            ]
-            to_test_ids = [n["id"] for n in to_test]
+        # Test only OpenVPN endpoints whose lifecycle backoff has expired.
+        # This prevents repeatedly reconnecting every failed node on each cycle.
+        batch_limit = (
+            ACTIVE_BACKGROUND_PROBE_BATCH
+            if active_tunnel_running()
+            else max(BACKGROUND_PROBE_BATCH, INITIAL_CONNECT_TEST_LIMIT * 2)
+        )
+        due_openvpn = node_pool.due_endpoints(("openvpn",), limit=batch_limit + len(initial_tested_ids))
+        to_test_ids: list[str] = []
+        seen_test_ids: set[str] = set()
+        for endpoint in due_openvpn:
+            metadata = endpoint.get("metadata") or {}
+            node_id = str(metadata.get("node_id") or "").strip()
+            if not node_id or node_id in initial_tested_ids or node_id in seen_test_ids:
+                continue
+            to_test_ids.append(node_id)
+            seen_test_ids.add(node_id)
+            if len(to_test_ids) >= batch_limit:
+                break
+        total_due = len(due_openvpn)
             
-        msg = f"开始对列表中所有候选节点进行周期连通性与延迟测试，待检测节点共 {len(to_test_ids)} 个"
+        msg = f"开始按退避队列低频轮询 OpenVPN，本轮检测 {len(to_test_ids)} 个到期节点（查询到 {total_due} 个候选），避免重复扫描与连接风暴"
         print(f"[周期检测] {msg}", flush=True)
         log_to_json("INFO", "Main", msg)
         
@@ -1925,7 +2637,7 @@ def maintain_valid_nodes(force: bool = False) -> str:
                 print(warn_msg, flush=True)
                 log_to_json("WARNING", "Main", warn_msg)
             
-            if not active_openvpn_running():
+            if not active_tunnel_running():
                 ui_cfg = load_ui_config()
                 connection_enabled = ui_cfg.get("connection_enabled", True)
                 if connection_enabled:
@@ -1972,7 +2684,7 @@ def collector_loop() -> None:
             log_to_json("ERROR", "Main", err_msg)
             set_state(last_check_at=time.time(), last_check_message=f"check error: {exc}")
             
-        if not active_openvpn_running() and not success:
+        if not active_tunnel_running() and not success:
             sleep_time = 30
         else:
             sleep_time = CHECK_INTERVAL_SECONDS
@@ -3792,6 +4504,37 @@ function render(){
         </div>
       </div>
     `;
+  } else if (state.active_pool_endpoint) {
+    const ep = state.active_pool_endpoint;
+    const latencyValue = Number(state.proxy_latency_ms || ep.latency_ms || 0);
+    const latencyClass = getLatencyClass(latencyValue);
+    const latencyText = latencyValue ? `<span class="latency-val ${latencyClass}">${latencyValue} ms</span>` : "-";
+    const protocolName = String(ep.protocol || state.active_tunnel_protocol || "VPN").toUpperCase();
+    const endpointAddress = ep.hostname || ep.current_ip || ep.endpoint_id || "-";
+    activeCardContainer.innerHTML = `
+      <div class="active-card">
+        <div class="active-card-info">
+          <div class="stat-icon-wrapper" style="background: rgba(16, 185, 129, 0.15); border-color: rgba(16, 185, 129, 0.3); width: 48px; height: 48px; border-radius: 12px;">
+            <svg xmlns="http://www.w3.org/2000/svg" class="stat-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5" style="color: #34d399; width: 24px; height: 24px;"><path stroke-linecap="round" stroke-linejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>
+          </div>
+          <div class="active-card-details">
+            <div class="active-card-title">
+              <span class="badge available"><span class="badge-pulse"></span>已连接</span>
+              <strong>${esc(protocolName)} · ${esc(translateCountry(ep.country || "-"))}</strong>
+            </div>
+            <div class="active-card-value mono" style="font-size: 20px; margin-top: 2px;">
+              ${esc(endpointAddress)}${ep.port ? ":" + esc(String(ep.port)) : ""}
+            </div>
+            <div class="active-card-meta" style="margin-top: 4px;">
+              <span>活动网卡: <strong>${esc(state.active_tunnel_interface || "-")}</strong></span>
+              <span style="margin-left: 12px;">7928 出口延时: <strong>${latencyText}</strong></span>
+              <span style="margin-left: 12px;">Hot Pool: <strong>${esc(String(state.hot_pool_size || 0))}/${esc(String(state.hot_pool_target || 0))}</strong></span>
+            </div>
+          </div>
+        </div>
+        <button class="btn-danger" style="height: 38px; padding: 0 16px; border-radius: 8px;" onclick="disconnectNode()">断开连接</button>
+      </div>
+    `;
   } else if (activeNode) {
     const latencyClass = getLatencyClass(activeNode.latency_ms);
     const latencyText = activeNode.latency_ms ? `<span class="latency-val ${latencyClass}">${activeNode.latency_ms} ms</span>` : "-";
@@ -4865,6 +5608,53 @@ function exportLogContent() {
 </script>
 </body></html>"""
 
+def local_proxy_port_reachable(timeout: float = 0.4) -> bool:
+    host = LOCAL_PROXY_HOST
+    candidates: list[tuple[int, str]] = []
+    if host in ("::", ""):
+        candidates = [(socket.AF_INET6, "::1"), (socket.AF_INET, "127.0.0.1")]
+    elif host == "0.0.0.0":
+        candidates = [(socket.AF_INET, "127.0.0.1")]
+    elif ":" in host:
+        candidates = [(socket.AF_INET6, host), (socket.AF_INET, "127.0.0.1")]
+    else:
+        candidates = [(socket.AF_INET, host)]
+    for af, target in candidates:
+        s = None
+        try:
+            s = socket.socket(af, socket.SOCK_STREAM)
+            s.settimeout(timeout)
+            s.connect((target, LOCAL_PROXY_PORT))
+            return True
+        except Exception:
+            pass
+        finally:
+            if s is not None:
+                try:
+                    s.close()
+                except Exception:
+                    pass
+    return False
+
+def reserve_link_probe_bytes(client_ip: str, requested: int) -> tuple[bool, int]:
+    now = time.time()
+    requested = max(0, int(requested))
+    with link_probe_lock:
+        started, used = link_probe_usage.get(client_ip, (now, 0))
+        if now - started >= LINK_PROBE_WINDOW_SECONDS:
+            started, used = now, 0
+        if used + requested > LINK_PROBE_WINDOW_BYTES:
+            retry_after = max(1, int(LINK_PROBE_WINDOW_SECONDS - (now - started)))
+            link_probe_usage[client_ip] = (started, used)
+            return False, retry_after
+        link_probe_usage[client_ip] = (started, used + requested)
+        # Opportunistic cleanup so the dict cannot grow forever.
+        if len(link_probe_usage) > 2048:
+            stale = [ip for ip, (ts, _) in link_probe_usage.items() if now - ts > LINK_PROBE_WINDOW_SECONDS * 2]
+            for ip in stale[:1024]:
+                link_probe_usage.pop(ip, None)
+        return True, 0
+
 def check_proxy_health() -> dict[str, Any]:
     # 1. 检测代理服务端口是否在监听
     is_ipv6 = ":" in LOCAL_PROXY_HOST
@@ -4900,12 +5690,13 @@ def check_proxy_health() -> dict[str, Any]:
             except Exception:
                 pass
 
-    # 2. 检测虚拟网卡 tun0 是否存在 (Linux 下)
-    tun_path = Path("/sys/class/net/tun0")
-    if sys.platform.startswith("linux") and not tun_path.exists():
+    # 2. 检测当前活动 VPN 网卡是否存在，不再写死 tun0。
+    active_iface = proxy_server.get_active_interface()
+    iface_path = Path("/sys/class/net") / active_iface
+    if sys.platform.startswith("linux") and not iface_path.exists():
         return {
             "ok": False,
-            "error": "[错误代码 3004] [ERR_ROUTE_DEV_NOT_FOUND] VPN 虚拟网卡 (tun0) 未启用，请确保当前已成功连接 VPN 节点"
+            "error": f"[错误代码 3004] [ERR_ROUTE_DEV_NOT_FOUND] 当前 VPN 网卡 ({active_iface}) 不存在，请确保隧道已成功建立"
         }
 
     # 3. 使用 curl 通过本地 SOCKS5 代理接口测试 IP 与实际延迟
@@ -4993,9 +5784,115 @@ def check_proxy_health() -> dict[str, Any]:
     except Exception as e:
         return {"ok": False, "error": f"出口连接测试异常: {e}"}
 
+def handle_confirmed_tunnel_failure(error_msg: str) -> None:
+    global is_connecting
+    if active_pool_endpoint_id:
+        failed_endpoint = active_pool_endpoint_id
+        try:
+            node_pool.record_endpoint_probe(failed_endpoint, False, 0, error_msg)
+        except Exception:
+            pass
+        if not try_unified_failover(exclude_endpoint_id=failed_endpoint, attempts=3):
+            stop_active_external_tunnel()
+            auto_switch_node()
+        return
+
+    if active_openvpn_node_id:
+        ui_cfg = load_ui_config()
+        routing_mode = ui_cfg.get("routing_mode", "auto")
+        if routing_mode != "fixed_ip":
+            failed_endpoint = ""
+            with lock:
+                nodes = read_nodes()
+                active_node = next((n for n in nodes if n.get("id") == active_openvpn_node_id), None)
+                if active_node:
+                    failed_endpoint = openvpn_pool_endpoint_id(active_node)
+                    mark_blacklisted(active_node, f"代理连续连通性检测失败: {error_msg}")
+                    active_node["probe_status"] = "unavailable"
+                    write_json(NODES_FILE, nodes)
+                    try:
+                        node_pool.record_probe(active_node, False, 0, error_msg)
+                    except Exception:
+                        pass
+            if not try_unified_failover(exclude_endpoint_id=failed_endpoint, attempts=4):
+                auto_switch_node()
+        else:
+            print(f"[代理守护线程] 固定 IP 模式下代理连续不可用，正在尝试重启连接同一节点: {active_openvpn_node_id}", flush=True)
+            is_connecting = False
+            try:
+                connect_node(active_openvpn_node_id)
+            except Exception as exc:
+                print(f"[代理守护线程] 重启固定节点失败: {exc}", flush=True)
+
+
+def owned_tunnel_local_liveness() -> tuple[bool, str]:
+    if active_pool_endpoint_id:
+        tunnel = active_external_tunnel
+        if tunnel is None:
+            return False, "活动多协议 TunnelResult 已丢失"
+        protocol = str(tunnel.protocol or "")
+        if protocol == "softether":
+            details = tunnel.details or {}
+            account = str(details.get("account") or "aimili")
+            ok, output = tunnel_adapters.SoftEtherAdapter().account_connected(account)
+            if not ok:
+                return False, f"SoftEther Session 已断开: {output[-500:]}"
+            if not tunnel_adapters.interface_has_ipv4(tunnel.interface):
+                return False, f"SoftEther 网卡 {tunnel.interface} 没有 IPv4"
+            return True, ""
+        if protocol == "sstp":
+            if tunnel.process is None or tunnel.process.poll() is not None:
+                return False, "SSTP/pppd 进程已退出"
+            if not tunnel_adapters.interface_has_ipv4(tunnel.interface):
+                return False, f"SSTP 网卡 {tunnel.interface} 没有 IPv4"
+            return True, ""
+        if protocol == "l2tp-ipsec":
+            if tunnel.process is None or tunnel.process.poll() is not None:
+                return False, "L2TP/IPsec helper 进程已退出"
+            if not tunnel.interface or not (Path("/sys/class/net") / tunnel.interface).exists():
+                return False, f"L2TP veth {tunnel.interface} 已消失"
+            return True, ""
+        return False, f"未知活动协议 {protocol}"
+
+    if active_openvpn_node_id:
+        if not active_openvpn_running():
+            return False, "OpenVPN 进程已退出"
+        if sys.platform.startswith("linux") and not Path("/sys/class/net/tun0").exists():
+            return False, "OpenVPN tun0 已消失"
+        return True, ""
+
+    return True, "idle"
+
+
+def fast_tunnel_liveness_loop() -> None:
+    time.sleep(3)
+    while True:
+        try:
+            if is_connecting or failover_lock.locked():
+                time.sleep(FAST_LIVENESS_INTERVAL_SECONDS)
+                continue
+            if not active_pool_endpoint_id and not active_openvpn_node_id:
+                time.sleep(FAST_LIVENESS_INTERVAL_SECONDS)
+                continue
+            ok, reason = owned_tunnel_local_liveness()
+            if not ok:
+                error_msg = f"本地快速存活检测失败: {reason}"
+                set_state(
+                    proxy_ok=False,
+                    proxy_ip="-",
+                    proxy_latency_ms=0,
+                    proxy_error=error_msg,
+                )
+                log_to_json("WARNING", "Proxy", error_msg)
+                handle_confirmed_tunnel_failure(error_msg)
+        except Exception as exc:
+            log_to_json("ERROR", "Proxy", f"快速存活守护异常: {exc}")
+        time.sleep(FAST_LIVENESS_INTERVAL_SECONDS)
+
+
 def background_proxy_checker() -> None:
     global last_checker_heartbeat, is_connecting
-    time.sleep(30)
+    time.sleep(PROXY_HEALTH_INTERVAL_SECONDS)
     while True:
         last_checker_heartbeat = time.time()
         try:
@@ -5003,7 +5900,26 @@ def background_proxy_checker() -> None:
                 time.sleep(5)
                 continue
 
-            res = check_proxy_health()
+            # Never infer ownership from an existing host tun/ppp interface.
+            # If this manager has no intended active endpoint, it is idle.
+            # If an endpoint ID still exists but the process/interface vanished,
+            # that is a real tunnel failure and must enter failover handling.
+            if not active_tunnel_running():
+                if not active_pool_endpoint_id and not active_openvpn_node_id:
+                    set_state(
+                        proxy_ok=False,
+                        proxy_ip="-",
+                        proxy_latency_ms=0,
+                        proxy_error="当前实例没有活动 VPN 隧道",
+                    )
+                    time.sleep(PROXY_HEALTH_INTERVAL_SECONDS)
+                    continue
+                res = {
+                    "ok": False,
+                    "error": "活动 VPN 隧道进程或网卡已消失",
+                }
+            else:
+                res = check_proxy_health()
             if res["ok"]:
                 set_state(
                     proxy_ok=True,
@@ -5016,7 +5932,7 @@ def background_proxy_checker() -> None:
                 first_error = res.get("error", "未知错误")
                 # A single public endpoint hiccup must not flap the production
                 # tunnel. Confirm once more before blacklisting or switching.
-                time.sleep(3)
+                time.sleep(PROXY_HEALTH_CONFIRM_DELAY_SECONDS)
                 confirm = check_proxy_health()
                 if confirm.get("ok"):
                     set_state(
@@ -5040,36 +5956,18 @@ def background_proxy_checker() -> None:
                 )
 
                 # Only confirmed failures can trigger production failover.
-                if active_openvpn_node_id:
-                    ui_cfg = load_ui_config()
-                    routing_mode = ui_cfg.get("routing_mode", "auto")
-                    if routing_mode != "fixed_ip":
-                        with lock:
-                            nodes = read_nodes()
-                            active_node = next((n for n in nodes if n.get("id") == active_openvpn_node_id), None)
-                            if active_node:
-                                mark_blacklisted(active_node, f"代理连续连通性检测失败: {error_msg}")
-                                active_node["probe_status"] = "unavailable"
-                                write_json(NODES_FILE, nodes)
-                        auto_switch_node()
-                    else:
-                        print(f"[代理守护线程] 固定 IP 模式下代理连续不可用，正在尝试重启连接同一节点: {active_openvpn_node_id}", flush=True)
-                        is_connecting = False
-                        try:
-                            connect_node(active_openvpn_node_id)
-                        except Exception as e:
-                            print(f"[代理守护线程] 重启固定节点失败: {e}", flush=True)
+                handle_confirmed_tunnel_failure(error_msg)
         except Exception as e:
             print(f"[错误] 代理后台检测发生异常: {e}", flush=True)
             log_to_json("ERROR", "Proxy", f"检测守护线程发生异常: {e}")
-        time.sleep(30)
+        time.sleep(PROXY_HEALTH_INTERVAL_SECONDS)
 
 def active_node_pinger() -> None:
     global last_pinger_heartbeat
     while True:
         last_pinger_heartbeat = time.time()
         try:
-            if active_openvpn_running() and active_openvpn_node_id:
+            if active_tunnel_running() and active_openvpn_node_id:
                 nodes = read_nodes()
                 node = next((n for n in nodes if n.get("id") == active_openvpn_node_id), None)
                 if node:
@@ -5188,6 +6086,12 @@ class Handler(BaseHTTPRequestHandler):
                 
         if effective_path in ("/", "/index.html"):
             self.send_bytes(INDEX_HTML.encode("utf-8"), "text/html; charset=utf-8")
+        elif effective_path == "/link-test":
+            try:
+                link_test_path = ROOT_DIR / "client_link_test.html"
+                self.send_bytes(link_test_path.read_bytes(), "text/html; charset=utf-8")
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         elif effective_path == "/api/nodes":
             global last_active_ping_time, last_active_latency, active_openvpn_node_id
             nodes = read_nodes()
@@ -5222,6 +6126,76 @@ class Handler(BaseHTTPRequestHandler):
                     del stripped["config_text"]
                 stripped_nodes.append(stripped)
             self.send_json({"nodes": stripped_nodes, "state": get_state()})
+        elif effective_path == "/api/protocol_capabilities":
+            self.send_json({"ok": True, "protocols": tunnel_adapters.capability_report()})
+        elif effective_path == "/api/node_pool_stats":
+            try:
+                self.send_json({"ok": True, "pool": node_pool.stats()})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+        elif effective_path == "/api/pool_endpoints":
+            try:
+                query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+                protocol = str((query.get("protocol") or [""])[0]).strip().lower() or None
+                limit = bounded_int((query.get("limit") or ["100"])[0], 100, 1, 500)
+                self.send_json({"ok": True, "endpoints": node_pool.list_endpoints(protocol=protocol, limit=limit)})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+        elif effective_path == "/api/hot_pool":
+            try:
+                query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+                limit = bounded_int((query.get("limit") or ["10"])[0], 10, 1, 20)
+                pool = node_pool.ranked_hot_pool(limit=limit, per_server_limit=2)
+                self.send_json({
+                    "ok": True,
+                    "hot_pool": pool,
+                    "count": len(pool),
+                    "target": HOT_POOL_TARGET,
+                    "deficit": max(0, HOT_POOL_TARGET - len(pool)),
+                })
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+        elif effective_path == "/api/link_probe":
+            # Client measures HTTP RTT externally. The response separates that
+            # client-to-server metric from local 7928 and VPN egress health.
+            state = get_state()
+            self.send_json({
+                "ok": True,
+                "server_time": time.time(),
+                "proxy_host": LOCAL_PROXY_HOST,
+                "proxy_port": LOCAL_PROXY_PORT,
+                "proxy_port_reachable": local_proxy_port_reachable(),
+                "proxy_ok": bool(state.get("proxy_ok")),
+                "proxy_latency_ms": parse_int(state.get("proxy_latency_ms")),
+                "active_tunnel_protocol": state.get("active_tunnel_protocol", ""),
+                "active_tunnel_interface": proxy_server.get_active_interface() if active_tunnel_running() else "",
+                "active_node_id": active_openvpn_node_id,
+                "active_pool_endpoint_id": active_pool_endpoint_id,
+                "pool": node_pool.stats(),
+                "hot_pool_size": state.get("hot_pool_size", 0),
+                "hot_pool_target": state.get("hot_pool_target", HOT_POOL_TARGET),
+                "last_failover_ok": state.get("last_failover_ok"),
+                "last_failover_duration_ms": state.get("last_failover_duration_ms", 0),
+                "last_failover_from_protocol": state.get("last_failover_from_protocol", ""),
+                "last_failover_to_protocol": state.get("last_failover_to_protocol", ""),
+            })
+        elif effective_path == "/api/link_probe_payload":
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            requested = bounded_int(
+                (query.get("bytes") or ["262144"])[0],
+                262144,
+                1024,
+                LINK_PROBE_MAX_BYTES,
+            )
+            client_ip = str(self.client_address[0] if self.client_address else "unknown")
+            allowed, retry_after = reserve_link_probe_bytes(client_ip, requested)
+            if not allowed:
+                self.send_json(
+                    {"ok": False, "error": "测速请求过于频繁", "retry_after_seconds": retry_after},
+                    HTTPStatus.TOO_MANY_REQUESTS,
+                )
+                return
+            self.send_bytes(b"0" * requested, "application/octet-stream")
         elif effective_path.startswith("/configs/"):
             filename = urllib.parse.unquote(effective_path.removeprefix("/configs/"))
             with lock:
@@ -5276,23 +6250,26 @@ class Handler(BaseHTTPRequestHandler):
                 "details": f"监听地址: {LOCAL_PROXY_HOST}:{LOCAL_PROXY_PORT}",
                 "error": proxy_err
             }
-            ovpn_ok = active_openvpn_running()
-            ovpn_err = ""
-            ovpn_details = "未连接"
-            if ovpn_ok:
-                ovpn_details = f"已连接节点: {active_openvpn_node_id}"
-                if sys.platform.startswith("linux"):
-                    if not Path("/sys/class/net/tun0").exists():
-                        ovpn_err = "[警告] 虚拟网卡 (tun0) 未启用，可能存在策略路由配置问题。"
-            else:
-                if active_openvpn_node_id:
-                    ovpn_err = "连接已中断或 OpenVPN 核心程序异常退出。"
-                    ovpn_details = f"尝试连接节点 {active_openvpn_node_id} 失败"
-            openvpn_status = {
-                "name": "OpenVPN 核心连接",
-                "status": "running" if ovpn_ok else "stopped",
-                "details": ovpn_details,
-                "error": ovpn_err
+            tunnel_ok = active_tunnel_running()
+            tunnel_state = get_state()
+            tunnel_protocol = str(tunnel_state.get("active_tunnel_protocol") or "")
+            tunnel_iface = str(tunnel_state.get("active_tunnel_interface") or "")
+            tunnel_id = active_pool_endpoint_id or active_openvpn_node_id
+            tunnel_err = ""
+            tunnel_details = "未连接"
+            if tunnel_ok:
+                tunnel_details = f"协议: {tunnel_protocol or 'unknown'}; 接口: {tunnel_iface or '-'}; 端点: {tunnel_id or '-'}"
+                if sys.platform.startswith("linux") and tunnel_iface:
+                    if not (Path("/sys/class/net") / tunnel_iface).exists():
+                        tunnel_err = f"[警告] 活动 VPN 网卡 ({tunnel_iface}) 不存在，可能存在隧道或策略路由问题。"
+            elif tunnel_id:
+                tunnel_err = "活动 VPN 隧道已中断或核心进程异常退出。"
+                tunnel_details = f"最近活动端点: {tunnel_id}"
+            tunnel_status = {
+                "name": "活动 VPN 隧道",
+                "status": "running" if tunnel_ok else "stopped",
+                "details": tunnel_details,
+                "error": tunnel_err
             }
             now = time.time()
             server_uptime = now - server_start_time
@@ -5322,7 +6299,7 @@ class Handler(BaseHTTPRequestHandler):
                 "services": [
                     web_ui_status,
                     proxy_gateway_status,
-                    openvpn_status,
+                    tunnel_status,
                     collector_status,
                     checker_status,
                     pinger_status
@@ -5680,7 +6657,7 @@ class Handler(BaseHTTPRequestHandler):
                     DATA_DIR.mkdir(exist_ok=True, parents=True)
                     write_json(auth_file, ui_cfg)
                 
-                stop_active_openvpn()
+                stop_all_tunnels()
                 with lock:
                     nodes = read_nodes()
                     for item in nodes:
@@ -5689,8 +6666,126 @@ class Handler(BaseHTTPRequestHandler):
                 global last_active_ping_time, last_active_latency
                 last_active_ping_time = 0.0
                 last_active_latency = 0
-                set_state(active_openvpn_node_id="", last_check_message="手动断开连接", active_node_latency="无活动连接")
+                proxy_server.clear_active_interface()
+                set_state(
+                    active_openvpn_node_id="",
+                    active_pool_endpoint_id="",
+                    active_pool_endpoint=None,
+                    active_tunnel_protocol="",
+                    active_tunnel_interface="",
+                    proxy_ok=False,
+                    proxy_ip="-",
+                    proxy_latency_ms=0,
+                    proxy_error="",
+                    last_check_message="手动断开连接",
+                    active_node_latency="无活动连接",
+                )
                 self.send_json({"ok": True})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+        elif effective_path == "/api/simulate_tunnel_failure":
+            try:
+                self.read_request_body()
+                if not ISOLATED_INSTANCE:
+                    self.send_json(
+                        {"ok": False, "error": "该测试接口仅允许隔离实例使用"},
+                        HTTPStatus.FORBIDDEN,
+                    )
+                    return
+
+                protocol = ""
+                endpoint_id = ""
+                if active_external_tunnel is not None:
+                    protocol = str(active_external_tunnel.protocol or "")
+                    endpoint_id = str(active_pool_endpoint_id or "")
+                    if protocol == "softether":
+                        details = active_external_tunnel.details or {}
+                        tunnel_adapters.SoftEtherAdapter().disconnect(
+                            account=str(details.get("account") or "aimili"),
+                            nic=str(details.get("nic") or "aimili"),
+                            delete=False,
+                        )
+                    elif protocol == "sstp":
+                        tunnel_adapters.SSTPAdapter.disconnect(active_external_tunnel.process)
+                    elif protocol == "l2tp-ipsec":
+                        l2tp_adapter.disconnect(active_external_tunnel.namespace)
+                    else:
+                        raise RuntimeError(f"不支持模拟故障的协议: {protocol}")
+                elif active_openvpn_running():
+                    protocol = "openvpn"
+                    endpoint_id = str(active_openvpn_node_id or "")
+                    stop_process(active_openvpn_process)
+                else:
+                    self.send_json({"ok": False, "error": "当前没有活动隧道"}, HTTPStatus.CONFLICT)
+                    return
+
+                set_state(
+                    simulated_failure_at=time.time(),
+                    simulated_failure_protocol=protocol,
+                    simulated_failure_endpoint=endpoint_id,
+                )
+                self.send_json({
+                    "ok": True,
+                    "protocol": protocol,
+                    "endpoint_id": endpoint_id,
+                    "message": "已模拟底层隧道故障，等待健康守护自动切换",
+                })
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+        elif effective_path == "/api/protocol_selftest":
+            try:
+                self.read_request_body()
+                l2tp = tunnel_adapters.L2TPIPsecAdapter.environment_report(run_kernel_test=True)
+                self.send_json({
+                    "ok": bool(l2tp.get("ready")),
+                    "l2tp_ipsec": l2tp,
+                    "protocols": tunnel_adapters.capability_report(),
+                }, HTTPStatus.OK if l2tp.get("ready") else HTTPStatus.SERVICE_UNAVAILABLE)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+        elif effective_path == "/api/link_probe_upload":
+            try:
+                requested = parse_int(self.headers.get("Content-Length"))
+                if requested <= 0 or requested > LINK_PROBE_MAX_BYTES:
+                    self.send_json(
+                        {"ok": False, "error": f"上传测速大小必须在 1 到 {LINK_PROBE_MAX_BYTES} 字节之间"},
+                        HTTPStatus.BAD_REQUEST,
+                    )
+                    return
+                client_ip = str(self.client_address[0] if self.client_address else "unknown")
+                allowed, retry_after = reserve_link_probe_bytes(client_ip, requested)
+                if not allowed:
+                    self.send_json(
+                        {"ok": False, "error": "测速请求过于频繁", "retry_after_seconds": retry_after},
+                        HTTPStatus.TOO_MANY_REQUESTS,
+                    )
+                    return
+                body = self.read_request_body(LINK_PROBE_MAX_BYTES)
+                self.send_json({
+                    "ok": True,
+                    "received_bytes": len(body),
+                    "server_time": time.time(),
+                })
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+        elif effective_path == "/api/refresh_protocol_catalog":
+            try:
+                self.read_request_body()
+                result = refresh_multi_protocol_catalog(force=True)
+                self.send_json(result, HTTPStatus.OK if result.get("ok") else HTTPStatus.BAD_GATEWAY)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+        elif effective_path == "/api/connect_pool_endpoint":
+            try:
+                payload = self.read_json_body()
+                endpoint_id = str(payload.get("endpoint_id") or "").strip()
+                if not endpoint_id:
+                    self.send_json({"ok": False, "error": "endpoint_id 不能为空"}, HTTPStatus.BAD_REQUEST)
+                    return
+                ui_cfg = load_ui_config()
+                ui_cfg["connection_enabled"] = True
+                write_json(DATA_DIR / "ui_auth.json", ui_cfg)
+                self.send_json({"ok": True, "message": connect_pool_endpoint(endpoint_id), "state": get_state()})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         elif effective_path == "/api/connect":
@@ -5773,7 +6868,8 @@ class Tee:
 
 def main() -> None:
     ensure_dirs()
-    kill_existing_openvpn_processes()
+    if not ISOLATED_INSTANCE:
+        kill_existing_openvpn_processes()
     
     log_file = DATA_DIR / "vpngate.log"
     tee = Tee(str(log_file))
@@ -5794,6 +6890,20 @@ def main() -> None:
             "is_connecting": True,
             "active_node_latency": "正在准备",
             "blacklisted_nodes": 0,
+            "isolated_instance": ISOLATED_INSTANCE,
+            "background_loops_disabled": DISABLE_BACKGROUND_LOOPS,
+            "collector_loop_enabled": ENABLE_COLLECTOR_LOOP,
+            "proxy_health_loop_enabled": ENABLE_PROXY_HEALTH_LOOP,
+            "fast_liveness_loop_enabled": ENABLE_FAST_LIVENESS_LOOP,
+            "fast_liveness_interval_seconds": FAST_LIVENESS_INTERVAL_SECONDS,
+            "pinger_loop_enabled": ENABLE_PINGER_LOOP,
+            "protocol_probe_loop_enabled": ENABLE_PROTOCOL_PROBE_LOOP,
+            "active_route_table": ACTIVE_ROUTE_TABLE,
+            "proxy_health_interval_seconds": PROXY_HEALTH_INTERVAL_SECONDS,
+            "proxy_health_confirm_delay_seconds": PROXY_HEALTH_CONFIRM_DELAY_SECONDS,
+            "failover_in_progress": False,
+            "last_failover_ok": None,
+            "last_failover_duration_ms": 0,
         },
     )
     threading.Thread(target=proxy_server.start_proxy_server, args=(LOCAL_PROXY_HOST, LOCAL_PROXY_PORT), daemon=True).start()
@@ -5841,9 +6951,24 @@ def main() -> None:
     else:
         print("[警告] 代理网关启动超时，继续执行脚本...", flush=True)
 
-    threading.Thread(target=collector_loop, daemon=True).start()
-    threading.Thread(target=background_proxy_checker, daemon=True).start()
-    threading.Thread(target=active_node_pinger, daemon=True).start()
+    enabled_loops: list[str] = []
+    if ENABLE_COLLECTOR_LOOP:
+        threading.Thread(target=collector_loop, daemon=True).start()
+        enabled_loops.append("collector")
+    if ENABLE_PROXY_HEALTH_LOOP:
+        threading.Thread(target=background_proxy_checker, daemon=True).start()
+        enabled_loops.append("proxy-health")
+    if ENABLE_FAST_LIVENESS_LOOP:
+        threading.Thread(target=fast_tunnel_liveness_loop, daemon=True).start()
+        enabled_loops.append("fast-liveness")
+    if ENABLE_PINGER_LOOP:
+        threading.Thread(target=active_node_pinger, daemon=True).start()
+        enabled_loops.append("pinger")
+    if ENABLE_PROTOCOL_PROBE_LOOP:
+        threading.Thread(target=protocol_probe_loop, daemon=True).start()
+        enabled_loops.append("protocol-probe")
+    if ISOLATED_INSTANCE:
+        print(f"[隔离实例] 已启用后台循环: {', '.join(enabled_loops) if enabled_loops else '无'}", flush=True)
     
     ui_cfg = load_ui_config()
     ui_host = ui_cfg.get("host", UI_HOST)

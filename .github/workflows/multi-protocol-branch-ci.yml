@@ -1,0 +1,293 @@
+name: multi-protocol-branch-ci
+
+on:
+  push:
+    branches:
+      - multi-protocol-pool-v1
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  python-syntax:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Ubuntu multi-protocol package names
+        run: |
+          sudo apt-get update -qq
+          apt-cache show softether-vpnclient softether-vpncmd strongswan strongswan-starter xl2tpd sstp-client ppp busybox >/dev/null
+      - name: Compile Python sources
+        run: |
+          python3 -m py_compile vpngate_manager.py proxy_server.py vpn_utils.py node_pool.py tunnel_adapters.py vpngate_discovery.py
+      - name: Import node pool
+        run: |
+          python3 - <<'PY'
+          import tempfile
+          from pathlib import Path
+          from node_pool import NodePool
+          with tempfile.TemporaryDirectory() as d:
+              p = NodePool(Path(d) / "pool.sqlite3")
+              print(p.stats())
+          PY
+
+      - name: Master pool metadata and hot-pool smoke test
+        run: |
+          python3 - <<'PY'
+          import tempfile
+          from pathlib import Path
+          from node_pool import NodePool
+
+          with tempfile.TemporaryDirectory() as d:
+              pool = NodePool(Path(d) / "pool.sqlite3")
+              node = {
+                  "id": "US_198.51.100.10_1195_udp",
+                  "host_name": "vpn100.opengw.net",
+                  "ip": "198.51.100.10",
+                  "remote_host": "198.51.100.10",
+                  "remote_port": 1195,
+                  "proto": "udp",
+                  "config_file": "/tmp/test.ovpn",
+                  "ping": 80,
+                  "speed": 200_000_000,
+                  "sessions": 4,
+                  "score": 1000,
+                  "country": "美国",
+              }
+              pool.upsert_openvpn_snapshot([node])
+              pool.upsert_discovery_snapshot([
+                  {
+                      "hostname": "vpn100.opengw.net",
+                      "ip": "198.51.100.10",
+                      "country": "United States",
+                      "ping": 70,
+                      "speed": 300_000_000,
+                      "sessions": 3,
+                      "score": 1500,
+                      "protocols": [
+                          {"protocol": "openvpn", "transport": "udp", "port": 1195},
+                          {"protocol": "softether", "transport": "tcp", "port": 443},
+                      ],
+                      "trusted_observation": True,
+                      "source_count": 2,
+                      "_sources": ["https://www.vpngate.net/en/", "https://mirror.example/en/"],
+                  },
+                  {
+                      "hostname": "vpn200.opengw.net",
+                      "ip": "203.0.113.20",
+                      "country": "Japan",
+                      "ping": 45,
+                      "speed": 500_000_000,
+                      "sessions": 2,
+                      "score": 2000,
+                      "protocols": [
+                          {"protocol": "sstp", "transport": "tcp", "port": 443},
+                      ],
+                      "trusted_observation": True,
+                      "source_count": 1,
+                      "_sources": ["https://www.vpngate.net/en/"],
+                  },
+                  {
+                      "hostname": "vpn300.opengw.net",
+                      "ip": "192.0.2.30",
+                      "country": "US",
+                      "ping": 20,
+                      "speed": 900_000_000,
+                      "sessions": 1,
+                      "score": 5000,
+                      "protocols": [
+                          {"protocol": "softether", "transport": "tcp", "port": 443},
+                      ],
+                      "trusted_observation": False,
+                      "source_count": 1,
+                      "_sources": ["https://mirror-only.example/en/"],
+                  },
+              ])
+
+              openvpn = pool.list_endpoints("openvpn", 10)[0]
+              assert openvpn["metadata"]["node_id"] == node["id"], openvpn
+
+              for _ in range(3):
+                  pool.record_probe(node, True, 80, "ok")
+              soft = pool.list_endpoints("softether", 10)[0]
+              sstp = pool.list_endpoints("sstp", 10)[0]
+              for _ in range(3):
+                  pool.record_endpoint_probe(soft["endpoint_id"], True, 60, "ok")
+                  pool.record_endpoint_probe(sstp["endpoint_id"], True, 45, "ok")
+
+              mirror_only = [
+                  e for e in pool.list_endpoints("softether", 10)
+                  if e["server_key"] == "vpn300.opengw.net"
+              ][0]
+              for _ in range(3):
+                  pool.record_endpoint_probe(mirror_only["endpoint_id"], True, 20, "synthetic")
+              hot = pool.ranked_hot_pool(limit=5, per_server_limit=1)
+              assert hot, "hot pool empty"
+              assert len({e["server_key"] for e in hot}) == len(hot), hot
+              assert all("selection_score" in e for e in hot), hot
+              assert all(e["server_key"] != "vpn300.opengw.net" for e in hot), hot
+              assert any(e["protocol"] == "sstp" for e in hot), hot
+              print([(e["protocol"], e["server_key"], e["selection_score"]) for e in hot])
+          PY
+      - name: VPNGate HTML protocol parser smoke test
+        run: |
+          python3 - <<'PY'
+          from vpngate_discovery import parse_server_table
+          html = """
+          <table><tr>
+            <td>United States</td>
+            <td><b>vpn123.opengw.net</b><span>198.51.100.9</span></td>
+            <td><b>3 sessions</b></td>
+            <td><b>200 Mbps</b> Ping: <b>50 ms</b></td>
+            <td>TCP: 443 UDP: Supported</td>
+            <td><a href="howto_l2tp.aspx">L2TP</a></td>
+            <td><a href="do_openvpn.aspx?fqdn=vpn123.opengw.net&ip=198.51.100.9&tcp=443&udp=1195">OpenVPN</a></td>
+            <td><a href="howto_sstp.aspx">SSTP</a> SSTP Hostname: vpn123.opengw.net:443</td>
+            <td>By test</td>
+            <td>1,234</td>
+          </tr></table>
+          """
+          rows = parse_server_table(html)
+          assert len(rows) == 1, rows
+          protocols = {(p["protocol"], p["transport"], p["port"]) for p in rows[0]["protocols"]}
+          assert ("softether", "tcp", 443) in protocols
+          assert ("softether", "udp", 443) in protocols
+          assert ("l2tp-ipsec", "udp", 0) in protocols
+          assert ("openvpn", "tcp", 443) in protocols
+          assert ("openvpn", "udp", 1195) in protocols
+          assert ("sstp", "tcp", 443) in protocols
+          print(protocols)
+          PY
+
+      - name: Client link HTTP integration smoke test
+        run: |
+          set -e
+          export VPNGATE_DATA_DIR="$RUNNER_TEMP/aimili-sidecar"
+          export LOCAL_PROXY_HOST=127.0.0.1
+          export LOCAL_PROXY_PORT=27928
+          export UI_HOST=127.0.0.1
+          export UI_PORT=28787
+          export ACTIVE_ROUTE_TABLE=220
+          export ISOLATED_INSTANCE=1
+          export DISABLE_BACKGROUND_LOOPS=1
+          python3 -u vpngate_manager.py >"$RUNNER_TEMP/aimili-sidecar.log" 2>&1 &
+          PID=$!
+          trap 'kill "$PID" >/dev/null 2>&1 || true' EXIT
+          for _ in $(seq 1 50); do
+            if python3 - <<'PY'
+          import socket,sys
+          s=socket.socket()
+          s.settimeout(0.2)
+          try:
+              s.connect(("127.0.0.1",28787))
+          except Exception:
+              sys.exit(1)
+          finally:
+              s.close()
+          PY
+            then break; fi
+            sleep 0.2
+          done
+          python3 - <<'PY'
+          import http.cookiejar
+          import json
+          import os
+          import urllib.request
+
+          data_dir=os.environ["VPNGATE_DATA_DIR"]
+          cfg=json.load(open(os.path.join(data_dir,"ui_auth.json"),encoding="utf-8"))
+          base=f"http://127.0.0.1:{cfg['port']}/{cfg['secret_path']}"
+          jar=http.cookiejar.CookieJar()
+          op=urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+
+          payload=json.dumps({"username":cfg["username"],"password":cfg["password"]}).encode()
+          req=urllib.request.Request(base+"/api/login",data=payload,headers={"Content-Type":"application/json"},method="POST")
+          with op.open(req,timeout=5) as r:
+              assert json.load(r)["ok"] is True
+
+          with op.open(base+"/link-test",timeout=5) as r:
+              body=r.read()
+              assert r.status==200 and b"17928" not in body
+              assert b"link_probe_upload" in body
+
+          with op.open(base+"/api/link_probe",timeout=5) as r:
+              probe=json.load(r)
+              assert probe["ok"] is True
+              assert probe["proxy_port"]==27928
+              assert probe["proxy_port_reachable"] is True
+
+          with op.open(base+"/api/link_probe_payload?bytes=65536",timeout=5) as r:
+              body=r.read()
+              assert len(body)==65536
+
+          upload=b"0"*32768
+          req=urllib.request.Request(
+              base+"/api/link_probe_upload",
+              data=upload,
+              headers={"Content-Type":"application/octet-stream"},
+              method="POST",
+          )
+          with op.open(req,timeout=5) as r:
+              result=json.load(r)
+              assert result["ok"] is True
+              assert result["received_bytes"]==32768
+
+          print("client link HTTP integration OK")
+          PY
+          kill "$PID"
+          wait "$PID" || true
+          trap - EXIT
+
+  ubuntu-runtime-prereqs:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install multi-protocol runtime dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends             iproute2 iptables curl ppp strongswan strongswan-starter xl2tpd sstp-client             softether-vpnclient softether-vpncmd
+      - name: Validate isolated namespace prerequisites
+        run: |
+          sudo python3 - <<'PY'
+          from tunnel_adapters import L2TPIPsecAdapter, capability_report
+          report = L2TPIPsecAdapter.environment_report(run_kernel_test=True)
+          print(report)
+          print(capability_report())
+          assert report["root"] is True
+          assert report["missing_commands"] == [], report
+          assert report["netns_supported"] is True
+          assert report["mount_namespace_supported"] is True
+          assert report["kernel_test_ok"] is True, report
+          PY
+      - name: Validate private-run strongSwan starter
+        run: |
+          set -e
+          TMPDIR="$(mktemp -d)"
+          cat > "$TMPDIR/ipsec.conf" <<'EOF'
+          config setup
+              uniqueids=no
+
+          conn dummy
+              keyexchange=ikev1
+              authby=psk
+              type=transport
+              left=127.0.0.1
+              right=192.0.2.1
+              auto=add
+          EOF
+          mkdir -p "$TMPDIR/run"
+          sudo ip netns add aimili-ci-ipsec
+          sudo ip netns exec aimili-ci-ipsec ip link set lo up
+          sudo ip netns exec aimili-ci-ipsec env RUN_DIR="$TMPDIR/run" CONF="$TMPDIR/ipsec.conf"             unshare --mount --propagation private bash -c '
+              set -e
+              mount --make-rprivate /
+              mount --bind "$RUN_DIR" /run
+              ipsec start --nofork --conf "$CONF" &
+              PID=$!
+              sleep 3
+              kill -0 "$PID"
+              kill "$PID"
+              wait "$PID" || true
+            '
+          sudo ip netns del aimili-ci-ipsec
+          rm -rf "$TMPDIR"
