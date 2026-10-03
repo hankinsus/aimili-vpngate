@@ -451,7 +451,11 @@ def clear_active_connection_state(message: str) -> None:
                     added_routes=details.get("added_host_routes") or [],
                 )
             elif active_external_tunnel.protocol == "sstp":
-                tunnel_adapters.SSTPAdapter.disconnect(active_external_tunnel.process)
+                details = active_external_tunnel.details or {}
+                tunnel_adapters.SSTPAdapter.disconnect(
+                    active_external_tunnel.process,
+                    added_routes=details.get("added_host_routes") or [],
+                )
         except Exception:
             pass
     active_external_tunnel = None
@@ -1259,7 +1263,11 @@ def stop_active_external_tunnel() -> None:
                 added_routes=details.get("added_host_routes") or [],
             )
         elif tunnel.protocol == "sstp":
-            tunnel_adapters.SSTPAdapter.disconnect(tunnel.process)
+            details = tunnel.details or {}
+            tunnel_adapters.SSTPAdapter.disconnect(
+                tunnel.process,
+                added_routes=details.get("added_host_routes") or [],
+            )
         elif tunnel.protocol == "l2tp-ipsec":
             l2tp_adapter.disconnect(tunnel.namespace or "aimili-l2tp-prod")
     except Exception as exc:
@@ -1343,7 +1351,11 @@ def connect_pool_endpoint(endpoint_id: str) -> str:
                     added_routes=details.get("added_host_routes") or [],
                 )
             elif result.protocol == "sstp":
-                tunnel_adapters.SSTPAdapter.disconnect(result.process)
+                details = result.details or {}
+                tunnel_adapters.SSTPAdapter.disconnect(
+                    result.process,
+                    added_routes=details.get("added_host_routes") or [],
+                )
             elif result.protocol == "l2tp-ipsec":
                 l2tp_adapter.disconnect(result.namespace)
         except Exception:
@@ -2165,7 +2177,10 @@ def probe_pool_endpoint(endpoint_id: str) -> dict[str, Any]:
             adapter = tunnel_adapters.SSTPAdapter()
             target = host if port in (0, 443) else f"{host}:{port}"
             result = adapter.connect(target, username="vpn", password="vpn", timeout=20)
-            cleanup = lambda: tunnel_adapters.SSTPAdapter.disconnect(result.process if result else None)
+            cleanup = lambda: tunnel_adapters.SSTPAdapter.disconnect(
+                result.process if result else None,
+                added_routes=((result.details or {}).get("added_host_routes") if result else []),
+            )
         elif protocol == "l2tp-ipsec":
             namespace = f"aimili-l2tp-p{token}"[:31]
             result = l2tp_adapter.connect(
