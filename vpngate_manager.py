@@ -96,6 +96,12 @@ def env_int(name: str, default: int, min_value: int | None = None, max_value: in
         return default
     return value
 
+def env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw in (None, ""):
+        return default
+    return str(raw).strip().lower() in ("1", "true", "yes", "on", "enabled")
+
 def bounded_int(value: Any, default: int, min_value: int | None = None, max_value: int | None = None) -> int:
     try:
         parsed = int(value)
@@ -130,6 +136,9 @@ LOCAL_PROXY_HOST = os.environ.get("LOCAL_PROXY_HOST", "127.0.0.1")
 LOCAL_PROXY_PORT = env_int("LOCAL_PROXY_PORT", 7928, 1, 65535)
 UI_HOST = os.environ.get("UI_HOST", "::")
 UI_PORT = env_int("UI_PORT", 8787, 1, 65535)
+ACTIVE_ROUTE_TABLE = env_int("ACTIVE_ROUTE_TABLE", 100, 1, 252)
+ISOLATED_INSTANCE = env_flag("ISOLATED_INSTANCE", False)
+DISABLE_BACKGROUND_LOOPS = env_flag("DISABLE_BACKGROUND_LOOPS", False)
 INVALID_BACKOFF_SECONDS = env_int("INVALID_BACKOFF_SECONDS", 30 * 60, 1)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
@@ -994,6 +1003,8 @@ def stop_process(process: subprocess.Popen[str] | None) -> None:
         process.kill()
 
 def kill_existing_openvpn_processes() -> None:
+    if ISOLATED_INSTANCE:
+        return
     if not sys.platform.startswith("linux"):
         return
     try:
@@ -1166,11 +1177,11 @@ def run_openvpn_until_ready(config_file: str, keep_alive: bool, route_nopull: bo
 
 def setup_policy_routing(interface: str = "tun0", gateway: str = "") -> None:
     try:
-        subprocess.run(["ip", "rule", "del", "table", "100"], capture_output=True, timeout=2)
+        subprocess.run(["ip", "rule", "del", "table", str(ACTIVE_ROUTE_TABLE)], capture_output=True, timeout=2)
     except Exception:
         pass
     try:
-        subprocess.run(["ip", "route", "flush", "table", "100"], capture_output=True, timeout=2)
+        subprocess.run(["ip", "route", "flush", "table", str(ACTIVE_ROUTE_TABLE)], capture_output=True, timeout=2)
     except Exception:
         pass
     
@@ -1183,9 +1194,9 @@ def setup_policy_routing(interface: str = "tun0", gateway: str = "") -> None:
             route_cmd.extend(["dev", interface])
             if gateway:
                 route_cmd.append("onlink")
-            route_cmd.extend(["table", "100"])
+            route_cmd.extend(["table", str(ACTIVE_ROUTE_TABLE)])
             subprocess.run(route_cmd, check=True, timeout=2)
-            subprocess.run(["ip", "rule", "add", "oif", interface, "table", "100"], check=True, timeout=2)
+            subprocess.run(["ip", "rule", "add", "oif", interface, "table", str(ACTIVE_ROUTE_TABLE)], check=True, timeout=2)
             # 配置反向路径过滤 rp_filter 为 loose 模式 (2)，防止回包被内核静默丢弃
             for proc_path in ["all", "default", interface]:
                 try:
@@ -1200,14 +1211,14 @@ def setup_policy_routing(interface: str = "tun0", gateway: str = "") -> None:
             time.sleep(1)
             
     if not success:
-        print("[路由配置失败] [错误代码 3003] [ERR_ROUTE_TABLE_ADD_FAILED] 策略路由配置失败。原因: 无法向路由表 100 添加默认路由，这可能会导致通过 VPN 接口的出站路由无法正常解析。请检查系统是否支持策略路由、iproute2 工具是否完整，以及是否具有 root 权限。", flush=True)
-        log_to_json("ERROR", "Routing", "[错误代码 3003] [ERR_ROUTE_TABLE_ADD_FAILED] 策略路由配置失败。原因: 无法向路由表 100 添加默认路由")
+        print(f"[路由配置失败] [错误代码 3003] [ERR_ROUTE_TABLE_ADD_FAILED] 策略路由配置失败。原因: 无法向路由表 {ACTIVE_ROUTE_TABLE} 添加默认路由，这可能会导致通过 VPN 接口的出站路由无法正常解析。请检查系统是否支持策略路由、iproute2 工具是否完整，以及是否具有 root 权限。", flush=True)
+        log_to_json("ERROR", "Routing", f"[错误代码 3003] [ERR_ROUTE_TABLE_ADD_FAILED] 策略路由配置失败。原因: 无法向路由表 {ACTIVE_ROUTE_TABLE} 添加默认路由")
 
 def cleanup_policy_routing() -> None:
     try:
-        subprocess.run(["ip", "rule", "del", "table", "100"], capture_output=True, timeout=2)
-        subprocess.run(["ip", "route", "flush", "table", "100"], capture_output=True, timeout=2)
-        print("[policy_routing] Cleared policy routing table 100", flush=True)
+        subprocess.run(["ip", "rule", "del", "table", str(ACTIVE_ROUTE_TABLE)], capture_output=True, timeout=2)
+        subprocess.run(["ip", "route", "flush", "table", str(ACTIVE_ROUTE_TABLE)], capture_output=True, timeout=2)
+        print(f"[policy_routing] Cleared policy routing table {ACTIVE_ROUTE_TABLE}", flush=True)
     except Exception:
         pass
 
@@ -1225,7 +1236,8 @@ def stop_active_openvpn() -> None:
         stop_process(active_openvpn_process)
         active_openvpn_process = None
         active_openvpn_node_id = ""
-        kill_existing_openvpn_processes()
+        if not ISOLATED_INSTANCE:
+            kill_existing_openvpn_processes()
         
         if config_to_delete:
             try:
@@ -6614,7 +6626,8 @@ class Tee:
 
 def main() -> None:
     ensure_dirs()
-    kill_existing_openvpn_processes()
+    if not ISOLATED_INSTANCE:
+        kill_existing_openvpn_processes()
     
     log_file = DATA_DIR / "vpngate.log"
     tee = Tee(str(log_file))
@@ -6635,6 +6648,9 @@ def main() -> None:
             "is_connecting": True,
             "active_node_latency": "正在准备",
             "blacklisted_nodes": 0,
+            "isolated_instance": ISOLATED_INSTANCE,
+            "background_loops_disabled": DISABLE_BACKGROUND_LOOPS,
+            "active_route_table": ACTIVE_ROUTE_TABLE,
         },
     )
     threading.Thread(target=proxy_server.start_proxy_server, args=(LOCAL_PROXY_HOST, LOCAL_PROXY_PORT), daemon=True).start()
@@ -6682,10 +6698,13 @@ def main() -> None:
     else:
         print("[警告] 代理网关启动超时，继续执行脚本...", flush=True)
 
-    threading.Thread(target=collector_loop, daemon=True).start()
-    threading.Thread(target=background_proxy_checker, daemon=True).start()
-    threading.Thread(target=active_node_pinger, daemon=True).start()
-    threading.Thread(target=protocol_probe_loop, daemon=True).start()
+    if DISABLE_BACKGROUND_LOOPS:
+        print("[隔离实例] 后台节点同步/健康检查/协议探测循环已禁用，仅响应手动 API 操作。", flush=True)
+    else:
+        threading.Thread(target=collector_loop, daemon=True).start()
+        threading.Thread(target=background_proxy_checker, daemon=True).start()
+        threading.Thread(target=active_node_pinger, daemon=True).start()
+        threading.Thread(target=protocol_probe_loop, daemon=True).start()
     
     ui_cfg = load_ui_config()
     ui_host = ui_cfg.get("host", UI_HOST)
