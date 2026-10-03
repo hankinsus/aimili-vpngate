@@ -143,6 +143,8 @@ ISOLATED_INSTANCE = env_flag("ISOLATED_INSTANCE", False)
 DISABLE_BACKGROUND_LOOPS = env_flag("DISABLE_BACKGROUND_LOOPS", False)
 ENABLE_COLLECTOR_LOOP = env_flag("ENABLE_COLLECTOR_LOOP", not DISABLE_BACKGROUND_LOOPS)
 ENABLE_PROXY_HEALTH_LOOP = env_flag("ENABLE_PROXY_HEALTH_LOOP", not DISABLE_BACKGROUND_LOOPS)
+ENABLE_FAST_LIVENESS_LOOP = env_flag("ENABLE_FAST_LIVENESS_LOOP", not DISABLE_BACKGROUND_LOOPS)
+FAST_LIVENESS_INTERVAL_SECONDS = env_int("FAST_LIVENESS_INTERVAL_SECONDS", 2, 1, 10)
 ENABLE_PINGER_LOOP = env_flag("ENABLE_PINGER_LOOP", not DISABLE_BACKGROUND_LOOPS)
 ENABLE_PROTOCOL_PROBE_LOOP = env_flag("ENABLE_PROTOCOL_PROBE_LOOP", not DISABLE_BACKGROUND_LOOPS)
 INVALID_BACKOFF_SECONDS = env_int("INVALID_BACKOFF_SECONDS", 30 * 60, 1)
@@ -168,6 +170,7 @@ active_external_tunnel: tunnel_adapters.TunnelResult | None = None
 active_pool_endpoint_id = ""
 protocol_discovery_lock = threading.Lock()
 protocol_probe_lock = threading.Lock()
+failover_lock = threading.Lock()
 link_probe_lock = threading.Lock()
 link_probe_usage: dict[str, tuple[float, int]] = {}
 last_protocol_discovery_at = 0.0
@@ -2335,6 +2338,9 @@ def endpoint_allowed_by_pool_routing(endpoint: dict[str, Any], ui_cfg: dict[str,
     return True
 
 def try_unified_failover(exclude_endpoint_id: str = "", attempts: int = 4) -> bool:
+    if not failover_lock.acquire(blocking=False):
+        # Another watcher is already performing the replacement.
+        return True
     started = time.time()
     from_protocol = ""
     from_endpoint = ""
@@ -2381,6 +2387,7 @@ def try_unified_failover(exclude_endpoint_id: str = "", attempts: int = 4) -> bo
                 "VPN",
                 f"统一 Hot Pool 切换成功 {from_protocol or '-'} -> {endpoint.get('protocol')}，耗时 {duration_ms} ms",
             )
+            failover_lock.release()
             return True
         except Exception as exc:
             last_error = str(exc)
@@ -2401,6 +2408,7 @@ def try_unified_failover(exclude_endpoint_id: str = "", attempts: int = 4) -> bo
         last_failover_to_endpoint="",
         last_failover_error=last_error or "无可用 Hot Pool 候选",
     )
+    failover_lock.release()
     return False
 
 def maintain_valid_nodes(force: bool = False) -> str:
@@ -5776,6 +5784,112 @@ def check_proxy_health() -> dict[str, Any]:
     except Exception as e:
         return {"ok": False, "error": f"出口连接测试异常: {e}"}
 
+def handle_confirmed_tunnel_failure(error_msg: str) -> None:
+    global is_connecting
+    if active_pool_endpoint_id:
+        failed_endpoint = active_pool_endpoint_id
+        try:
+            node_pool.record_endpoint_probe(failed_endpoint, False, 0, error_msg)
+        except Exception:
+            pass
+        if not try_unified_failover(exclude_endpoint_id=failed_endpoint, attempts=3):
+            stop_active_external_tunnel()
+            auto_switch_node()
+        return
+
+    if active_openvpn_node_id:
+        ui_cfg = load_ui_config()
+        routing_mode = ui_cfg.get("routing_mode", "auto")
+        if routing_mode != "fixed_ip":
+            failed_endpoint = ""
+            with lock:
+                nodes = read_nodes()
+                active_node = next((n for n in nodes if n.get("id") == active_openvpn_node_id), None)
+                if active_node:
+                    failed_endpoint = openvpn_pool_endpoint_id(active_node)
+                    mark_blacklisted(active_node, f"代理连续连通性检测失败: {error_msg}")
+                    active_node["probe_status"] = "unavailable"
+                    write_json(NODES_FILE, nodes)
+                    try:
+                        node_pool.record_probe(active_node, False, 0, error_msg)
+                    except Exception:
+                        pass
+            if not try_unified_failover(exclude_endpoint_id=failed_endpoint, attempts=4):
+                auto_switch_node()
+        else:
+            print(f"[代理守护线程] 固定 IP 模式下代理连续不可用，正在尝试重启连接同一节点: {active_openvpn_node_id}", flush=True)
+            is_connecting = False
+            try:
+                connect_node(active_openvpn_node_id)
+            except Exception as exc:
+                print(f"[代理守护线程] 重启固定节点失败: {exc}", flush=True)
+
+
+def owned_tunnel_local_liveness() -> tuple[bool, str]:
+    if active_pool_endpoint_id:
+        tunnel = active_external_tunnel
+        if tunnel is None:
+            return False, "活动多协议 TunnelResult 已丢失"
+        protocol = str(tunnel.protocol or "")
+        if protocol == "softether":
+            details = tunnel.details or {}
+            account = str(details.get("account") or "aimili")
+            ok, output = tunnel_adapters.SoftEtherAdapter().account_connected(account)
+            if not ok:
+                return False, f"SoftEther Session 已断开: {output[-500:]}"
+            if not tunnel_adapters.interface_has_ipv4(tunnel.interface):
+                return False, f"SoftEther 网卡 {tunnel.interface} 没有 IPv4"
+            return True, ""
+        if protocol == "sstp":
+            if tunnel.process is None or tunnel.process.poll() is not None:
+                return False, "SSTP/pppd 进程已退出"
+            if not tunnel_adapters.interface_has_ipv4(tunnel.interface):
+                return False, f"SSTP 网卡 {tunnel.interface} 没有 IPv4"
+            return True, ""
+        if protocol == "l2tp-ipsec":
+            if tunnel.process is None or tunnel.process.poll() is not None:
+                return False, "L2TP/IPsec helper 进程已退出"
+            if not tunnel.interface or not (Path("/sys/class/net") / tunnel.interface).exists():
+                return False, f"L2TP veth {tunnel.interface} 已消失"
+            return True, ""
+        return False, f"未知活动协议 {protocol}"
+
+    if active_openvpn_node_id:
+        if not active_openvpn_running():
+            return False, "OpenVPN 进程已退出"
+        if sys.platform.startswith("linux") and not Path("/sys/class/net/tun0").exists():
+            return False, "OpenVPN tun0 已消失"
+        return True, ""
+
+    return True, "idle"
+
+
+def fast_tunnel_liveness_loop() -> None:
+    time.sleep(3)
+    while True:
+        try:
+            if is_connecting or failover_lock.locked():
+                time.sleep(FAST_LIVENESS_INTERVAL_SECONDS)
+                continue
+            if not active_pool_endpoint_id and not active_openvpn_node_id:
+                time.sleep(FAST_LIVENESS_INTERVAL_SECONDS)
+                continue
+            ok, reason = owned_tunnel_local_liveness()
+            if not ok:
+                error_msg = f"本地快速存活检测失败: {reason}"
+                set_state(
+                    proxy_ok=False,
+                    proxy_ip="-",
+                    proxy_latency_ms=0,
+                    proxy_error=error_msg,
+                )
+                log_to_json("WARNING", "Proxy", error_msg)
+                handle_confirmed_tunnel_failure(error_msg)
+        except Exception as exc:
+            log_to_json("ERROR", "Proxy", f"快速存活守护异常: {exc}")
+        time.sleep(FAST_LIVENESS_INTERVAL_SECONDS)
+
+
 def background_proxy_checker() -> None:
     global last_checker_heartbeat, is_connecting
     time.sleep(PROXY_HEALTH_INTERVAL_SECONDS)
@@ -5842,45 +5956,7 @@ def background_proxy_checker() -> None:
                 )
 
                 # Only confirmed failures can trigger production failover.
-                if active_pool_endpoint_id:
-                    failed_endpoint = active_pool_endpoint_id
-                    try:
-                        node_pool.record_endpoint_probe(failed_endpoint, False, 0, error_msg)
-                    except Exception:
-                        pass
-                    # Preserve the failed-but-still-present tunnel until a new
-                    # candidate is independently verified. connect_pool_endpoint()
-                    # will release the old tunnel only after the new one passes
-                    # direct egress validation (true make-before-break).
-                    if not try_unified_failover(exclude_endpoint_id=failed_endpoint, attempts=3):
-                        stop_active_external_tunnel()
-                        auto_switch_node()
-                elif active_openvpn_node_id:
-                    ui_cfg = load_ui_config()
-                    routing_mode = ui_cfg.get("routing_mode", "auto")
-                    if routing_mode != "fixed_ip":
-                        failed_endpoint = ""
-                        with lock:
-                            nodes = read_nodes()
-                            active_node = next((n for n in nodes if n.get("id") == active_openvpn_node_id), None)
-                            if active_node:
-                                failed_endpoint = openvpn_pool_endpoint_id(active_node)
-                                mark_blacklisted(active_node, f"代理连续连通性检测失败: {error_msg}")
-                                active_node["probe_status"] = "unavailable"
-                                write_json(NODES_FILE, nodes)
-                                try:
-                                    node_pool.record_probe(active_node, False, 0, error_msg)
-                                except Exception:
-                                    pass
-                        if not try_unified_failover(exclude_endpoint_id=failed_endpoint, attempts=4):
-                            auto_switch_node()
-                    else:
-                        print(f"[代理守护线程] 固定 IP 模式下代理连续不可用，正在尝试重启连接同一节点: {active_openvpn_node_id}", flush=True)
-                        is_connecting = False
-                        try:
-                            connect_node(active_openvpn_node_id)
-                        except Exception as e:
-                            print(f"[代理守护线程] 重启固定节点失败: {e}", flush=True)
+                handle_confirmed_tunnel_failure(error_msg)
         except Exception as e:
             print(f"[错误] 代理后台检测发生异常: {e}", flush=True)
             log_to_json("ERROR", "Proxy", f"检测守护线程发生异常: {e}")
@@ -6781,6 +6857,8 @@ def main() -> None:
             "background_loops_disabled": DISABLE_BACKGROUND_LOOPS,
             "collector_loop_enabled": ENABLE_COLLECTOR_LOOP,
             "proxy_health_loop_enabled": ENABLE_PROXY_HEALTH_LOOP,
+            "fast_liveness_loop_enabled": ENABLE_FAST_LIVENESS_LOOP,
+            "fast_liveness_interval_seconds": FAST_LIVENESS_INTERVAL_SECONDS,
             "pinger_loop_enabled": ENABLE_PINGER_LOOP,
             "protocol_probe_loop_enabled": ENABLE_PROTOCOL_PROBE_LOOP,
             "active_route_table": ACTIVE_ROUTE_TABLE,
@@ -6843,6 +6921,9 @@ def main() -> None:
     if ENABLE_PROXY_HEALTH_LOOP:
         threading.Thread(target=background_proxy_checker, daemon=True).start()
         enabled_loops.append("proxy-health")
+    if ENABLE_FAST_LIVENESS_LOOP:
+        threading.Thread(target=fast_tunnel_liveness_loop, daemon=True).start()
+        enabled_loops.append("fast-liveness")
     if ENABLE_PINGER_LOOP:
         threading.Thread(target=active_node_pinger, daemon=True).start()
         enabled_loops.append("pinger")
