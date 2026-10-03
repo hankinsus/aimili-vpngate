@@ -1037,47 +1037,101 @@ exit 42
         return report
 
     @staticmethod
-    def egress_check(result: TunnelResult, timeout: int = 9) -> dict[str, Any]:
+    def egress_check(result: TunnelResult, timeout: int = 10) -> dict[str, Any]:
         if not result.namespace or not result.inner_interface:
             return {"ok": False, "error": "L2TP namespace/interface missing"}
 
-        # Resolve outside the isolated namespace. Ubuntu commonly exposes
-        # systemd-resolved on 127.0.0.53, which is not reachable from a fresh netns.
-        try:
-            infos = socket.getaddrinfo("api.ipify.org", 443, socket.AF_INET, socket.SOCK_STREAM)
-            if not infos:
-                return {"ok": False, "error": "Unable to resolve api.ipify.org on root namespace"}
-            api_ip = str(infos[0][4][0])
-        except Exception as exc:
-            return {"ok": False, "error": f"Root DNS lookup failed: {exc}"}
+        def run_in_ns(curl_args: list[str], command_timeout: int = timeout) -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                ["ip", "netns", "exec", result.namespace, "curl", *curl_args],
+                capture_output=True,
+                text=True,
+                timeout=command_timeout,
+            )
 
-        cmd = [
-            "ip", "netns", "exec", result.namespace,
-            "curl", "-4", "-sS",
+        errors: list[str] = []
+
+        # First choice: fixed IP, no DNS dependency, returns the observed exit IP.
+        cf_args = [
+            "-4", "-k", "-sS",
             "--interface", f"if!{result.inner_interface}",
-            "--resolve", f"api.ipify.org:443:{api_ip}",
             "-w", "\\n%{time_total} %{http_code}",
-            "https://api.ipify.org",
+            "https://1.1.1.1/cdn-cgi/trace",
             "--connect-timeout", "4",
             "--max-time", "8",
         ]
         try:
-            res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-            if res.returncode != 0:
-                return {"ok": False, "error": (res.stderr or f"curl exit {res.returncode}")[-500:]}
-            lines = res.stdout.strip().splitlines()
-            if len(lines) < 2:
-                return {"ok": False, "error": "L2TP egress check returned no data"}
-            timing = lines[-1].split()
-            if len(timing) != 2 or timing[1] != "200":
-                return {"ok": False, "error": f"L2TP egress HTTP error: {lines[-1]}"}
-            return {
-                "ok": True,
-                "ip": lines[0].strip(),
-                "latency_ms": int(float(timing[0]) * 1000),
-            }
+            res = run_in_ns(cf_args)
+            if res.returncode == 0:
+                lines = res.stdout.strip().splitlines()
+                timing = lines[-1].split() if lines else []
+                exit_ip = ""
+                for line in lines[:-1]:
+                    if line.startswith("ip="):
+                        exit_ip = line.split("=", 1)[1].strip()
+                        break
+                if len(timing) == 2 and timing[1] == "200" and exit_ip:
+                    return {
+                        "ok": True,
+                        "ip": exit_ip,
+                        "latency_ms": int(float(timing[0]) * 1000),
+                        "check": "cloudflare-trace",
+                    }
+                errors.append(f"cloudflare_bad_response={lines[-3:] if lines else []}")
+            else:
+                errors.append(f"cloudflare_exit={res.returncode} err={(res.stderr or '').strip()[-500:]}")
         except Exception as exc:
-            return {"ok": False, "error": str(exc)}
+            errors.append(f"cloudflare_exception={exc}")
+
+        # Second choice: resolve on root namespace, then force that address in netns.
+        try:
+            infos = socket.getaddrinfo("api.ipify.org", 443, socket.AF_INET, socket.SOCK_STREAM)
+            api_ip = str(infos[0][4][0]) if infos else ""
+        except Exception as exc:
+            api_ip = ""
+            errors.append(f"root_dns_exception={exc}")
+
+        if api_ip:
+            ipify_args = [
+                "-4", "-sS",
+                "--interface", f"if!{result.inner_interface}",
+                "--resolve", f"api.ipify.org:443:{api_ip}",
+                "-w", "\\n%{time_total} %{http_code}",
+                "https://api.ipify.org",
+                "--connect-timeout", "4",
+                "--max-time", "8",
+            ]
+            try:
+                res = run_in_ns(ipify_args)
+                if res.returncode == 0:
+                    lines = res.stdout.strip().splitlines()
+                    timing = lines[-1].split() if lines else []
+                    ip = lines[0].strip() if len(lines) >= 2 else ""
+                    if len(timing) == 2 and timing[1] == "200" and ip:
+                        return {
+                            "ok": True,
+                            "ip": ip,
+                            "latency_ms": int(float(timing[0]) * 1000),
+                            "check": "ipify-resolve",
+                        }
+                    errors.append(f"ipify_bad_response={lines[-3:] if lines else []}")
+                else:
+                    errors.append(f"ipify_exit={res.returncode} err={(res.stderr or '').strip()[-500:]}")
+            except Exception as exc:
+                errors.append(f"ipify_exception={exc}")
+
+        for label, cmd in (
+            ("addr", ["ip", "netns", "exec", result.namespace, "ip", "-4", "addr", "show", "dev", result.inner_interface]),
+            ("route", ["ip", "netns", "exec", result.namespace, "ip", "-4", "route"]),
+            ("route_get", ["ip", "netns", "exec", result.namespace, "ip", "-4", "route", "get", "1.1.1.1"]),
+        ):
+            try:
+                diag = subprocess.run(cmd, capture_output=True, text=True, timeout=3)
+                errors.append(f"{label}={(diag.stdout or diag.stderr).strip()[-800:]}")
+            except Exception as exc:
+                errors.append(f"{label}_exception={exc}")
+
+        return {"ok": False, "error": " | ".join(errors)[-3500:]}
 
 def capability_report() -> dict[str, Any]:
     return {
